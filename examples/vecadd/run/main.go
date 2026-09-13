@@ -1,22 +1,26 @@
 // Runs the kernels from ../vecadd.go on the GPU through gocudrv
 // (pure-Go CUDA driver bindings, no cgo: libcuda.so.1 is dlopen'ed at run time).
 //
-//	gocuda build -o vecadd.ptx ./examples/vecadd && go run ./examples/vecadd/run vecadd.ptx
+// The PTX is compiled in-process by cudair.Build (needs llgen + LLVM, like
+// the gocuda command). To use a pre-built file instead:
+//
+//	gocuda build -o vecadd.ptx ./examples/vecadd && go run ./examples/vecadd/run -ptx vecadd.ptx
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 
 	"github.com/eitamring/gocudrv/cuda"
+	"github.com/mehdi-shokohi/cuda-ir.go"
 )
 
 func main() {
-	ptx := "vecadd.ptx"
-	if len(os.Args) > 1 {
-		ptx = os.Args[1]
-	}
+	ptxFile := flag.String("ptx", "", "use this pre-built PTX instead of compiling the kernels")
+	verbose := flag.Bool("v", false, "print the compiler commands")
+	flag.Parse()
 	must(cuda.Init())
 	dev, err := cuda.GetDevice(0)
 	must(err)
@@ -25,9 +29,7 @@ func main() {
 	ctx, err := dev.Primary()
 	must(err)
 	defer ctx.Close()
-	src, err := os.ReadFile(ptx)
-	must(err)
-	mod, err := ctx.LoadModule(src)
+	mod, err := ctx.LoadModule(loadPTX(*ptxFile, *verbose))
 	must(err)
 	defer mod.Close()
 
@@ -72,6 +74,23 @@ func main() {
 	must(ctx.Synchronize(bg))
 	must(da.CopyTo(bg, out))
 	report("Square", out, func(i int) float32 { return a[i] * a[i] })
+}
+
+// loadPTX compiles the kernel package to PTX, or reads file if given.
+func loadPTX(file string, verbose bool) []byte {
+	if file != "" {
+		src, err := os.ReadFile(file)
+		must(err)
+		return src
+	}
+	opts := &cudair.Options{}
+	if verbose {
+		opts.Log = os.Stderr
+	}
+	res, err := cudair.Build("github.com/mehdi-shokohi/cuda-ir.go/examples/vecadd", opts)
+	must(err)
+	fmt.Println("kernels:", res.Kernels)
+	return res.PTX
 }
 
 func report(name string, got []float32, want func(i int) float32) {

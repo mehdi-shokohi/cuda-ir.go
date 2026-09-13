@@ -1,28 +1,30 @@
+// Runs the kernels from ../features.go on the GPU and checks each result
+// against a CPU model. The PTX is compiled in-process by cudair.Build;
+// -ptx file uses a pre-built one instead (see examples/vecadd/run).
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"math"
 	"os"
 
 	"github.com/eitamring/gocudrv/cuda"
+	"github.com/mehdi-shokohi/cuda-ir.go"
 )
 
 func main() {
-	ptx := "features.ptx"
-	if len(os.Args) > 1 {
-		ptx = os.Args[1]
-	}
+	ptxFile := flag.String("ptx", "", "use this pre-built PTX instead of compiling the kernels")
+	verbose := flag.Bool("v", false, "print the compiler commands")
+	flag.Parse()
 	must(cuda.Init())
 	dev, err := cuda.GetDevice(0)
 	must(err)
 	ctx, err := dev.Primary()
 	must(err)
 	defer ctx.Close()
-	src, err := os.ReadFile(ptx)
-	must(err)
-	mod, err := ctx.LoadModule(src)
+	mod, err := ctx.LoadModule(loadPTX(*ptxFile, *verbose))
 	must(err)
 	bg := context.Background()
 	const n = 1 << 16
@@ -103,6 +105,22 @@ func main() {
 	t := make([]int64, 4)
 	must(dt.CopyTo(bg, t))
 	check("Clock64", t[0] > 0 && t[1] > 0, fmt.Sprintf("cycles per block: %v", t))
+}
+
+// loadPTX compiles the kernel package to PTX, or reads file if given.
+func loadPTX(file string, verbose bool) []byte {
+	if file != "" {
+		src, err := os.ReadFile(file)
+		must(err)
+		return src
+	}
+	opts := &cudair.Options{}
+	if verbose {
+		opts.Log = os.Stderr
+	}
+	res, err := cudair.Build("github.com/mehdi-shokohi/cuda-ir.go/examples/features", opts)
+	must(err)
+	return res.PTX
 }
 
 func check(name string, ok bool, detail string) {

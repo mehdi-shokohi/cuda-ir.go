@@ -1,4 +1,4 @@
-module github.com/mehdi-shokohi/gocuda
+module github.com/mehdi-shokohi/cuda-ir.go
 
 go 1.27
 

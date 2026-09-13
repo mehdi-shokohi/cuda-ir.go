@@ -1,6 +1,6 @@
 package vecadd
 
-import "github.com/mehdi-shokohi/gocuda/cuda"
+import "github.com/mehdi-shokohi/cuda-ir.go/cuda"
 
 // VecAdd: out[i] = a[i] + b[i]. Exported + returns nothing => a kernel.
 func VecAdd(a, b, out cuda.Buf[float32], n int32) {

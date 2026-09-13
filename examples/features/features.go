@@ -5,7 +5,7 @@ package features
 import (
 	"sync/atomic"
 
-	"github.com/mehdi-shokohi/gocuda/cuda"
+	"github.com/mehdi-shokohi/cuda-ir.go/cuda"
 )
 
 const blockSize = 256

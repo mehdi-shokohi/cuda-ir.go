@@ -1,11 +1,22 @@
-# gocuda — write CUDA kernels in Go
+# cuda-ir.go — write CUDA kernels in native Go
 
-Write GPU kernels in plain Go, compile them to PTX, launch them from Go.
+`cuda-ir.go` lets you write CUDA kernels in plain Go and run them on NVIDIA GPUs — no C, no nvcc, no cgo.
+
+- **Kernels are Go functions.** `threadIdx`, `__shared__`, `__syncthreads`, warp shuffles, atomics and
+  libdevice math are all a `cuda.*` call away; `sync/atomic` just works.
+- **Go → PTX.** [llgo](https://github.com/xgo-dev/llgo) lowers the package to LLVM IR; `cudair` rewrites it
+  for the NVPTX backend and hands it to `llc`. The CUDA driver JITs the PTX for whatever GPU is present.
+- **Compile in-process or ahead of time.** `cudair.Build("./kernels", nil)` gives you PTX bytes at run time;
+  `gocuda build` writes a `.ptx` to `//go:embed` and ship.
+- **Pure-Go host side.** Launch through [gocudrv](https://github.com/eitamring/gocudrv) — `libcuda.so.1` is
+  dlopen'ed, `CGO_ENABLED=0` builds work.
+- **Go semantics on the GPU.** Nil derefs and out-of-range indexes become a PTX `trap`; anything that needs
+  the Go runtime is a compile error, not a silent crash.
 
 ```go
 package kernels
 
-import "github.com/mehdi-shokohi/gocuda/cuda"
+import "github.com/mehdi-shokohi/cuda-ir.go/cuda"
 
 // Exported + returns nothing  =>  a CUDA kernel named "VecAdd".
 func VecAdd(a, b, out cuda.Buf[float32], n int32) {
@@ -16,16 +27,13 @@ func VecAdd(a, b, out cuda.Buf[float32], n int32) {
 }
 ```
 
-```bash
-gocuda build -o kernels.ptx ./kernels     # Go -> PTX
-```
-
 ```go
 // host side: pure Go, no cgo (github.com/eitamring/gocudrv)
+res, _ := cudair.Build("example.com/myapp/kernels", nil)   // Go -> PTX, in-process
 cuda.Init()
 dev, _ := cuda.GetDevice(0)
 ctx, _ := dev.Primary()
-mod, _ := ctx.LoadModule(ptxBytes)             // e.g. //go:embed kernels.ptx
+mod, _ := ctx.LoadModule(res.PTX)
 k, _ := mod.Function("VecAdd")
 da, _ := cuda.Alloc[float32](ctx, n); da.CopyFrom(bg, a)   // db, dout likewise
 k.Launch(bg, cuda.LaunchConfig1D(n, 256), cuda.Arg(da), cuda.Arg(db), cuda.Arg(dout), cuda.ArgValue(int32(n)))
@@ -33,18 +41,23 @@ ctx.Synchronize(bg)
 dout.CopyTo(bg, out)
 ```
 
-How it works: [llgo](https://github.com/xgo-dev/llgo) compiles the Go package to LLVM IR,
-`gocuda build` rewrites that IR for the NVPTX backend (symbol names, kernel calling
-convention, shared memory, panics → `trap`, libdevice math) and runs LLVM's `llc`
-to produce PTX. The CUDA driver JIT-compiles the PTX for whatever GPU is present.
+The same compiler is a command for build-time use:
+
+```bash
+gocuda build -o kernels.ptx ./kernels     # Go -> PTX; ship the file, //go:embed it, ...
+```
+
+How it works: llgo compiles the Go package to LLVM IR, `cudair` rewrites that IR for the
+NVPTX backend (symbol names, kernel calling convention, shared memory, panics → `trap`,
+libdevice math) and runs LLVM's `llc` to produce PTX.
 
 ## Installation
 
 ### Quick: `install.sh`
 
 ```bash
-git clone https://github.com/mehdi-shokohi/gocuda.git
-cd gocuda && ./install.sh          # -y to skip questions
+git clone https://github.com/mehdi-shokohi/cuda-ir.go.git
+cd cuda-ir.go && ./install.sh          # -y to skip questions
 source ~/.bashrc                   # (or ~/.zshrc) picks up LLGO_ROOT and PATH
 make test                          # compiles the examples and runs them on your GPU
 ```
@@ -97,10 +110,10 @@ export LLGO_ROOT=~/llgo                      # put this in your shell profile
   optional `ptxas` build-time check. Any 12.x/13.x toolkit works; `gocuda` looks in
   `$CUDA_HOME`, `/usr/local/cuda*`, `/opt/cuda`, or `$LIBDEVICE`.
 
-#### 5. gocuda
+#### 5. cuda-ir.go (the `gocuda` command)
 
 ```bash
-go install github.com/mehdi-shokohi/gocuda/cmd/gocuda@latest
+go install github.com/mehdi-shokohi/cuda-ir.go/cmd/gocuda@latest
 gocuda doctor
 ```
 `doctor` prints every dependency with a fix hint:
@@ -120,17 +133,56 @@ ok       libcuda.so.1   NVIDIA driver (needed at run time only)
 
 ```bash
 go mod init example.com/myapp
-go get github.com/mehdi-shokohi/gocuda            # cuda.* device API
+go get github.com/mehdi-shokohi/cuda-ir.go            # cudair.Build + cuda.* device API
 go get github.com/eitamring/gocudrv               # host API (no cgo)
 ```
 
-Layout that works well:
-
 ```
 myapp/
-  kernels/kernels.go      # package kernels: your GPU code, imports gocuda/cuda
+  kernels/kernels.go      # package kernels: your GPU code, imports cuda-ir.go/cuda
+  main.go                 # compiles + launches the kernels with gocudrv
+```
+
+There are two ways to get from `kernels/` to PTX; both run the same pipeline
+and need llgen/LLVM on the machine that does the compiling.
+
+### From Go: `cudair.Build`
+
+```go
+import "github.com/mehdi-shokohi/cuda-ir.go" // package cudair
+
+res, err := cudair.Build("example.com/myapp/kernels", nil)      // or "./kernels"
+// res.PTX     []byte   -> ctx.LoadModule(res.PTX)
+// res.Kernels []string -> "VecAdd", ...
+```
+
+`Build` resolves the package with `go list` from the current directory
+(`Options.Dir` to change that), so the program must run inside the module that
+holds the kernels — it is the "compile on start" / dev-loop mode; every run
+recompiles. `Options` mirrors the command flags:
+
+```go
+cudair.Build("./kernels", &cudair.Options{
+	SM:      "sm_80",            // llc/ptxas target (driver JIT adapts it)
+	Kernels: []string{"VecAdd"}, // default: all exported void funcs
+	Opt:     "2",                // "0" skips opt
+	NoCheck: true,               // skip the ptxas check
+	WorkDir: "build",            // keep the intermediate .ll files here
+	Log:     os.Stderr,          // print the commands
+})
+```
+
+`cudair.BuildFile(pkg, "kernels.ptx", opts)` additionally writes the file.
+`cudair.Doctor(os.Stdout)` is the `doctor` command.
+
+### From the command line: `gocuda build`
+
+For shipping a binary without the LLVM toolchain: generate the PTX at build
+time and embed it.
+
+```
   kernels/gen.go          # //go:generate gocuda build -o kernels.ptx .
-  main.go                 # //go:embed kernels/kernels.ptx ; launches with gocudrv
+  main.go                 # //go:embed kernels/kernels.ptx
 ```
 
 ```bash
@@ -138,7 +190,7 @@ go generate ./...     # -> kernels/kernels.ptx
 go run .
 ```
 
-`gocuda build` options:
+Options:
 
 ```
 -o file.ptx     output (default <pkg>.ptx)
@@ -200,16 +252,20 @@ for the pattern.
 
 ```bash
 export LLGO_ROOT=~/llgo
-make test        # builds examples/vecadd and examples/features to PTX and runs them on the GPU
+make test        # runs examples/vecadd and examples/features on the GPU (PTX compiled in-process)
+make test-ptx    # same through `gocuda build` + `-ptx file`
 ```
 
 - `examples/vecadd` — VecAdd, Saxpy (grid-stride loop), Square (calls a device func)
 - `examples/features` — block reduction with shared memory + `__syncthreads` + warp
   shuffles + float atomics, `sync/atomic` counters, warp votes, libdevice math, `clock64`
 
-## What `gocuda build` does to llgo's IR
+Each `run/main.go` calls `cudair.Build` by default; `-ptx file` loads a pre-built
+PTX instead, `-v` prints the compiler commands.
 
-llgo has no NVPTX target; its output needs these rewrites before `llc`/`ptxas` accept it:
+## What the compiler does to llgo's IR
+
+llgo has no NVPTX target; its output needs these rewrites (`cudair.Build` / `gocuda build`) before `llc`/`ptxas` accept it:
 
 1. target triple / datalayout → `nvptx64-nvidia-cuda`
 2. symbol names: PTX identifiers allow only `[A-Za-z0-9_$]`; llgo's `pkg.Func` and

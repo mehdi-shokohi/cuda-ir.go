@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gocuda dependency installer: LLVM 22, llgo + llgen, gocuda, LLGO_ROOT.
+# cuda-ir.go dependency installer: LLVM 22, llgo + llgen, the gocuda command, LLGO_ROOT.
 #
 #   ./install.sh            # interactive (asks before sudo / editing your profile)
 #   ./install.sh -y         # no questions
@@ -9,14 +9,14 @@
 #   LLGO_REPO   llgo git URL or local path     (default: https://github.com/xgo-dev/llgo.git)
 #   LLGO_REF    llgo commit/tag to check out   (default: tested commit below)
 #   LLVM_VER    LLVM major version             (default: 22)
-#   GOCUDA_REF  gocuda version for go install  (default: this checkout if run from the repo, else @latest)
+#   GOCUDA_REF  cuda-ir.go version for go install  (default: this checkout if run from the repo, else @latest)
 set -euo pipefail
 
 LLVM_VER=${LLVM_VER:-22}
 LLGO_ROOT=${LLGO_ROOT:-$HOME/llgo}
 LLGO_REPO=${LLGO_REPO:-https://github.com/xgo-dev/llgo.git}
-LLGO_REF=${LLGO_REF:-4606197d8}          # tested with gocuda; "main" for latest
-GOCUDA_MODULE=github.com/mehdi-shokohi/gocuda
+LLGO_REF=${LLGO_REF:-4606197d8}          # tested with cuda-ir.go; "main" for latest
+GOCUDA_MODULE=github.com/mehdi-shokohi/cuda-ir.go
 YES=0
 [[ "${1:-}" == "-y" ]] && YES=1
 
@@ -132,7 +132,7 @@ need=()
 for l in "${lines[@]}"; do grep -qxF "$l" "$profile" 2>/dev/null || need+=("$l"); done
 if [[ ${#need[@]} -gt 0 ]]; then
     if ask "Append to $profile: ${need[*]} ?"; then
-        { echo; echo "# gocuda"; printf '%s\n' "${need[@]}"; } >> "$profile"
+        { echo; echo "# cuda-ir.go"; printf '%s\n' "${need[@]}"; } >> "$profile"
         ok "written; run:  source $profile"
     else
         warn "add these yourself: ${need[*]}"
