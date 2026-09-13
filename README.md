@@ -41,6 +41,11 @@ ctx.Synchronize(bg)
 dout.CopyTo(bg, out)
 ```
 
+To try it: `make deps` installs everything the compiler needs (LLVM 22, the llgo
+checkout + `llgen`, `gocuda`), then `make test` runs the examples on your GPU — see
+[Installation](#installation). The full runnable version of the snippet above is
+`main_test.go` (`go test -run TestVecAdd -v .`).
+
 The same compiler is a command for build-time use:
 
 ```bash
@@ -250,10 +255,17 @@ for the pattern.
 
 ## Examples
 
+The examples compile the kernels at run time, so the machine needs the full
+toolchain first: run `make deps` once (it is `./install.sh`, see
+[Installation](#installation)) and make sure `LLGO_ROOT` points at the llgo checkout
+it created (default `~/llgo`; `make` sets it if the variable is empty).
+
 ```bash
-export LLGO_ROOT=~/llgo
+make deps        # once: LLVM 22, llgo + llgen, gocuda, checks the NVIDIA driver / CUDA toolkit
+make doctor      # verify every dependency
 make test        # runs examples/vecadd and examples/features on the GPU (PTX compiled in-process)
 make test-ptx    # same through `gocuda build` + `-ptx file`
+go test -v .     # the README VecAdd sample as a Go test (main_test.go)
 ```
 
 - `examples/vecadd` — VecAdd, Saxpy (grid-stride loop), Square (calls a device func)
