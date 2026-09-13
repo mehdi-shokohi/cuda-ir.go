@@ -169,6 +169,7 @@ recompiles. `Options` mirrors the command flags:
 ```go
 cudair.Build("./kernels", &cudair.Options{
 	SM:      "sm_80",            // llc/ptxas target (driver JIT adapts it)
+	PTX:     "78",               // PTX ISA version to emit (73 minimum)
 	Kernels: []string{"VecAdd"}, // default: all exported void funcs
 	Opt:     "2",                // "0" skips opt
 	NoCheck: true,               // skip the ptxas check
@@ -200,6 +201,7 @@ Options:
 ```
 -o file.ptx     output (default <pkg>.ptx)
 -sm sm_80       target for llc/ptxas (the driver JIT adapts PTX to the actual GPU)
+-ptx 78         PTX ISA version to emit (CUDA 11.8+; 73 minimum)
 -kernel A,B     only these functions become kernels (default: all exported void funcs)
 -O 2            LLVM optimisation level (0 disables)
 -keep           keep intermediate .ll files
@@ -212,46 +214,77 @@ Options:
 | Go | GPU |
 |---|---|
 | exported func returning nothing | kernel `.entry`, PTX name = Go name |
-| unexported func | device function (inlined when possible) |
+| unexported func | device function (inlined when possible; `//go:noinline` is honoured) |
 | `cuda.Buf[T]`, `*T` parameter | device pointer — pass `cuda.Arg(buffer)` |
+| `[]T` parameter | Go slice (24-byte param), bounds-checked — pass `host.ArgSlice(buffer)` |
+| struct parameter | passed by value — pass `cuda.ArgRaw` with the same layout |
 | `int32/uint32/int64/uint64/int/float32/float64` parameter | `cuda.ArgValue(v)` with the **same** Go type (`int` is 64-bit) |
 | `var t cuda.Shared[[256]float32]` at package level | `__shared__` memory (`t.Get()` → `*[256]float32`) |
+| `var d cuda.DynShared[float32]` at package level | `extern __shared__` (`d.Buf()`; size = `LaunchConfig.SharedMemBytes`) |
+| `var C = cuda.Constant[[4]float32]{V: ...}` (exported) | `__constant__`; host: `mod.Global("C")` + `cuda.WriteGlobal` |
+| exported package-level `var X int32` | `__device__` global; host reads/writes it by name, `res.Globals` lists them |
+| `//cuda:launch_bounds 256 2`, `//cuda:maxnreg 32` doc comment | `__launch_bounds__(256, 2)`, `__maxnreg__(32)` |
 | `sync/atomic` on device pointers | native `atom.*` instructions |
-| `cuda.Sqrt/Sin/Exp/...` | PTX instruction or libdevice |
-| `math.*`, `fmt`, any other stdlib | **compile error** (not available on the GPU) |
-| nil deref / index out of range | PTX `trap` → the launch fails with an error |
-| `make`, `append`, maps, strings, interfaces, goroutines, `defer`, closures | **compile error** (need the Go runtime) |
+| `cuda.Sqrt/Sin/Exp/...`, `math.Sqrt/Float32bits/...`, `math/bits.*` | PTX instruction or libdevice |
+| `panic(...)`, nil deref, index out of range, integer `/ 0` | PTX `trap` → the launch fails with an error |
+| `&T{}`, `copy()`, `for range`, local arrays that escape, plain function values | stack-allocated (nothing outlives the kernel), `memmove`, indirect `call` |
+| `fmt`, any other stdlib, `make`, `append`, maps, strings ops, interfaces, goroutines, `defer`, closures | **compile error** (need the Go runtime) |
 
-`Buf[T].At/Set` are unchecked like C; indexing Go arrays (e.g. shared memory) is bounds-checked.
+`Buf[T].At/Set` are unchecked like C; indexing Go arrays and slices is bounds-checked.
+`cuda.Printf` is the device `printf`.
 
 ## Device API (CUDA C ↔ package cuda)
 
-All verified on hardware by `examples/features`.
+All verified on hardware by `go test .` (`examples/features`, `examples/intrinsics`, `examples/memory`).
 
 | CUDA C | Go |
 |---|---|
 | `threadIdx/blockIdx/blockDim/gridDim .x/.y/.z` | `ThreadIdxX()` … `GridDimZ()` |
 | `blockIdx.x*blockDim.x+threadIdx.x` | `GlobalIdX/Y/Z()`, `GridStrideX()` |
-| `warpSize`, lane id | `WarpSize()`, `LaneID()` |
+| `warpSize`, lane id, `%smid %nsmid %warpid %nwarpid %gridid` | `WarpSize()`, `LaneID()`, `SMID() NumSMs() WarpID() NumWarps() GridID()` |
+| `%lanemask_eq/lt/le/gt/ge` | `LaneMaskEq/Lt/Le/Gt/Ge()` |
 | `__syncthreads()`, `_and/_or/_count` | `SyncThreads()`, `SyncThreadsAnd/Or/Count()` |
+| named barriers `bar.sync id, n` / `bar.arrive id, n` | `SyncBarrier(id, n)`, `ArriveBarrier(id, n)` |
 | `__syncwarp(mask)` | `SyncWarp(mask)` |
 | `__threadfence[_block/_system]()` | `ThreadFence[Block/System]()` |
-| `__shared__ T x[N]` | `var x cuda.Shared[[N]T]`; `x.Get()` |
-| `__shfl_sync/_up/_down/_xor` | `Shfl/ShflUp/ShflDown/ShflXor` (+ `F32` variants) |
+| `this_grid().sync()` (cooperative groups) | `cuda.GridBarrier` + `LaunchCooperative` |
+| `__shared__ T x[N]`, `extern __shared__ T x[]` | `var x cuda.Shared[[N]T]`; `var x cuda.DynShared[T]` |
+| `__constant__ T x[N]` | `var X cuda.Constant[[N]T]` |
+| `__shfl_sync/_up/_down/_xor` (+ `width`) | `Shfl/ShflUp/ShflDown/ShflXor` (+ `F32`, `64`, `F64`, `…Width` variants) |
 | `__all_sync/__any_sync/__ballot_sync/__activemask` | `All/Any/Ballot/ActiveMask` |
+| `__match_any_sync/__match_all_sync` (sm_70) | `MatchAny/MatchAll` (+ `64`) |
+| `__reduce_add/min/max/and/or/xor_sync` (sm_80) | `ReduceAdd/Min/Max/MinU/MaxU/And/Or/Xor` |
 | integer `atomicAdd/Sub/Exch/CAS/And/Or/Xor` | Go `sync/atomic` (`AddInt32`, `CompareAndSwapInt32`, `SwapInt32`, …) |
-| `atomicAdd(float*/double*)` | `AtomicAddFloat32/64` |
+| `atomicMin/atomicMax` (`int/unsigned/long long/unsigned long long`) | `AtomicMin/MaxInt32/Uint32/Int64/Uint64` |
+| `atomicAdd(float*/double*)`, `atomicExch(float*)`, `atomicCAS(float*)` | `AtomicAddFloat32/64`, `AtomicSwapFloat32/64`, `AtomicCASFloat32/64` |
 | `atomicInc/atomicDec` | `AtomicInc/AtomicDec` |
-| `sqrtf fabsf floorf ceilf truncf roundf fmaf fminf fmaxf` | `Sqrt Abs Floor Ceil Trunc Round FMA Min Max` |
-| `sinf cosf tanf expf exp2f logf log2f powf tanhf erff rsqrtf` (+ double) | `Sin Cos Tan Exp Exp2 Log Log2 Pow Tanh Erf Rsqrt` (+ `…64`) |
-| `__sinf __cosf __expf __logf __powf` (fast) | `FastSin FastCos FastExp FastLog FastPow` |
-| `clock() clock64() globaltimer` | `Clock() Clock64() GlobalTimer()` |
+| `atomicAdd_block / atomicAdd_system` | `AtomicAddInt32/64Block`, `AtomicAddInt32/64System` |
+| `cuda::atomic_ref` `load(acquire)` / `store(release)` | `LoadAcquireInt32/64`, `StoreReleaseInt32/64` |
+| `volatile T*` | `VolatileLoad/StoreInt32/Int64/Float32/Float64` |
+| `__ldg(p)` | `LdgF32/F64/I32/I64` (→ `ld.global.nc`) |
+| `float4/int4` loads and stores | `LoadFloat4/StoreFloat4`, `LoadInt4/StoreInt4` |
+| `cp.async` / `__pipeline_memcpy_async` (sm_80) | `CpAsync4/8/16`, `CpAsync16CG`, `CpAsyncCommit`, `CpAsyncWait1/2`, `CpAsyncWaitAll` |
+| `__half`, `__nv_bfloat16` (+ `__hadd/__hmul/__hfma` …) | `cuda.Half`, `cuda.BFloat16` (`FloatToHalf`, `.Float32()`, `.Add/Sub/Mul/Div/FMA`) |
+| `__popc/__popcll __clz/__clzll __ffs/__ffsll __brev/__brevll` | `Popc/Popc64 Clz/Clz64 Ffs/Ffs64 Brev/Brev64` (or `math/bits`) |
+| `__byte_perm __funnelshift_l/r __mulhi/__umulhi/__mul64hi/__umul64hi __mul24/__umul24 __sad/__usad __hadd/__rhadd/__uhadd` | `BytePerm FunnelShiftL/R MulHi/MulHiU/MulHi64/MulHiU64 Mul24/Mul24U Sad/SadU HAdd/RHAdd/HAddU` |
+| `sqrtf fabsf floorf ceilf truncf roundf rintf nearbyintf fmaf fminf fmaxf fdimf copysignf` | `Sqrt Abs Floor Ceil Trunc Round Rint Nearbyint FMA Min Max Fdim Copysign` |
+| `sinf cosf tanf sincosf asinf acosf atanf atan2f sinhf coshf asinhf acoshf atanhf sinpif cospif` | `Sin Cos Tan Sincos Asin Acos Atan Atan2 Sinh Cosh Asinh Acosh Atanh Sinpi Cospi` |
+| `expf exp2f exp10f expm1f logf log2f log10f log1pf powf cbrtf hypotf rsqrtf` | `Exp Exp2 Exp10 Expm1 Log Log2 Log10 Log1p Pow Cbrt Hypot Rsqrt` |
+| `erff erfcf erfinvf tgammaf lgammaf normcdff j0f j1f fmodf remainderf ldexpf frexpf modff isnan isinf isfinite` | `Erf Erfc Erfinv Tgamma Lgamma NormCdf J0 J1 Fmod Remainder Ldexp Frexp Modf IsNaN IsInf IsFinite` |
+| double versions of the above | `Sqrt64 Sin64 … Tan64 Floor64 Rsqrt64 Exp2_64 Log2_64 Tanh64 Erf64 Atan2_64 Cbrt64 Hypot64 …` |
+| `__sinf __cosf __tanf __expf __exp10f __logf __log2f __log10f __powf __sincosf __fdividef` (fast) | `FastSin FastCos FastTan FastExp FastExp10 FastLog FastLog2 FastLog10 FastPow FastSincos FastDiv` |
+| `__fadd_rn/_rz __fmul_rn __frcp_rn __fsqrt_rn __frsqrt_rn __saturatef __float2int_rn __float2uint_rn` | `AddRN AddRZ MulRN RcpRN SqrtRN RsqrtRN Saturate Float32ToInt32RN Float32ToUint32RN` |
+| `__float_as_uint / __uint_as_float / __double_as_longlong` | `Float32Bits Float32FromBits Float64Bits Float64FromBits` (or `math.Float32bits`) |
+| `clock() clock64() globaltimer`, `__nanosleep(ns)` | `Clock() Clock64() GlobalTimer()`, `NanoSleep(ns)` |
+| `__trap() __brkpt() __builtin_assume(c)` | `Trap() Breakpoint() Assume(c)` |
+| `__isGlobal/__isShared/__isConstant/__isLocal` | `IsGlobal/IsShared/IsConstant/IsLocal(p)` |
+| `printf(fmt, ...)` | `Printf(fmt, Args().Int(i).Float(x)...)` |
 
-Not yet covered: `atomicMin/Max` on ints, dynamic shared memory (`extern __shared__`),
-device `printf`, half precision / tensor cores (`wmma`), textures, cooperative-groups grid
-sync, `__popc/__clz/__brev`, `__nanosleep`. Each is one `//go:linkname` to an
-`llvm.nvvm.*` / `llvm.*` intrinsic or a libdevice `__nv_*` function; see `cuda/sync.go`
-for the pattern.
+Not yet covered — see [ROADMAP.md](ROADMAP.md): tensor cores (`wmma`/`mma`), textures and
+surfaces, thread block clusters / distributed shared memory / TMA (sm_90), `__reduce_min/max_sync`
+on floats (sm_100), `elect.sync`, the cache-hint loads (`__ldcg` & co), `__grid_constant__`,
+`griddepcontrol`. Most are one `//go:linkname` to an `llvm.nvvm.*` intrinsic or one IR helper
+in `helpers.go`.
 
 ## Examples
 
@@ -271,6 +304,12 @@ go test -v .     # the README VecAdd sample as a Go test (main_test.go)
 - `examples/vecadd` — VecAdd, Saxpy (grid-stride loop), Square (calls a device func)
 - `examples/features` — block reduction with shared memory + `__syncthreads` + warp
   shuffles + float atomics, `sync/atomic` counters, warp votes, libdevice math, `clock64`
+- `examples/intrinsics` (`go test -run TestIntrinsics`) — special registers, integer
+  intrinsics and `math/bits`, `__match_*`/`__reduce_*`/64-bit shuffles, named barriers,
+  `atomicMin/Max` & scoped atomics, the full libdevice math (float32 and float64)
+- `examples/memory` (`go test -run 'TestMemory|TestTraps'`) — dynamic shared memory,
+  `__constant__`/`__device__` globals, `__launch_bounds__`, device `printf`, `panic`/`copy`/
+  slice parameters, `__ldg`/`volatile`/`float4`, half precision, `cp.async`, grid barrier
 
 Each `run/main.go` calls `cudair.Build` by default; `-ptx file` loads a pre-built
 PTX instead, `-v` prints the compiler commands.
@@ -283,13 +322,22 @@ llgo has no NVPTX target; its output needs these rewrites (`cudair.Build` / `goc
 2. symbol names: PTX identifiers allow only `[A-Za-z0-9_$]`; llgo's `pkg.Func` and
    `github.com/.../runtime.X` are mangled (kernels keep their short Go name)
 3. kernels get the `ptx_kernel` calling convention (`.entry`)
-4. llgo's nil/bounds-check calls (`runtime.AssertNilDeref`, `runtime.PanicIndex`) become
-   `llvm.trap`; other runtime dependencies are reported as unsupported
-5. `init()` of imported packages is stubbed; other unresolved Go symbols are errors
-6. `cuda.Shared[T]` package globals move to `addrspace(3)`
-7. `__nv_*` uses pull just the needed functions out of libdevice
-8. generic instantiations become `linkonce_odr` (inlinable), everything but the kernels is
-   internalized, and `infer-address-spaces` yields `ld.shared` / `ld.global`
+4. llgo's panic calls (`runtime.PanicIndex`, `runtime.Panic`, `Assert*`) become `llvm.trap`;
+   heap allocation (`runtime.AllocU/AllocZ`) becomes an `alloca` at the call site and
+   `copy()` (`runtime.SliceCopy`) a `memmove`; a call to any other runtime function is an error
+5. `init()` of imported packages is stubbed; `math/bits.*`, `math.Float32bits` & co get
+   intrinsic bodies; other unresolved Go symbols are errors
+6. `cuda.Shared` / `DynShared` / `Constant` package globals move to `addrspace(3)` / `(4)`;
+   exported globals keep their Go name for `cuModuleGetGlobal`
+7. `cuda.Buf[T]` kernel parameters become plain pointer parameters, so llc knows they are
+   global memory (`ld.global` instead of generic loads; `__ldg` → `ld.global.nc`)
+8. `cudair.*` IR helpers (`helpers.go`) supply what Go cannot spell: `atomicrmw min/max`,
+   scoped/acquire-release atomics, volatile and invariant loads, `half`/`bfloat` arithmetic,
+   `<4 x float>` accesses, `cp.async`; `//cuda:launch_bounds` directives become attributes
+9. `__nv_*` uses pull just the needed functions out of libdevice
+10. everything is inlined and the inliner's lifetime markers stripped (an `alloca` behind a
+    `&T{}` constructor must live as long as the kernel), then `-O2` with everything but the
+    kernels internalized, and `infer-address-spaces` yields `ld.shared` / `ld.global` / `ld.const`
 
 ## Host bindings compared (2026-09, CUDA 13.1 / driver 580)
 

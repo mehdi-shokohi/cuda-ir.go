@@ -16,9 +16,10 @@ examples: install   ## compile the example kernels to PTX
 	gocuda build -o examples/vecadd/vecadd.ptx ./examples/vecadd
 	gocuda build -o examples/features/features.ptx ./examples/features
 
-test:               ## run the examples on the GPU; each compiles its PTX in-process (no cgo needed)
+test:               ## run the examples and the Go tests on the GPU; each compiles its PTX in-process (no cgo needed)
 	CGO_ENABLED=0 go run ./examples/vecadd/run
 	CGO_ENABLED=0 go run ./examples/features/run
+	CGO_ENABLED=0 go test -count=1 -v .
 
 test-ptx: examples  ## same, but with the PTX produced by the gocuda command
 	CGO_ENABLED=0 go run ./examples/vecadd/run -ptx examples/vecadd/vecadd.ptx

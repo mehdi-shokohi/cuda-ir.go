@@ -17,9 +17,16 @@
 //     ("pkg.Func" -> "pkg_Func"; llc aborts on '/', ptxas on '.')
 //  3. kernels marked `ptx_kernel` so they become `.entry` (launchable).
 //     Default: every exported function of the root package returning nothing.
-//  4. `declare` of void llgo runtime helpers (PanicIndex, AssertNilDeref...)
-//     replaced by bodies that `trap` — Go panics become device traps.
-//     A runtime helper that returns a value is reported as unsupported.
+//  4. `declare` of llgo runtime helpers replaced: panics (PanicIndex,
+//     AssertNilDeref, Panic...) by bodies that `trap`, heap allocation
+//     (AllocU/AllocZ) and copy() (SliceCopy) by stack-based device
+//     implementations (helpers.go). A call to any other runtime helper is
+//     reported as unsupported.
+//  5. cuda.Shared / DynShared / Constant globals move to their address
+//     space; exported package-level variables keep their Go name.
+//  6. `cudair.*` IR helpers, math/bits and math.Float32bits & co get bodies.
+//  7. `//cuda:launch_bounds N [M]` / `//cuda:maxnreg N` doc-comment
+//     directives become NVPTX function attributes.
 package cudair
 
 import (
@@ -33,6 +40,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -44,8 +52,14 @@ var (
 	reQuoted = regexp.MustCompile(`@"([^"]*)"`)
 	reBare   = regexp.MustCompile(`@([A-Za-z0-9_.$]+)`)
 	reDefine = regexp.MustCompile(`^define (.*?)(void|[^ ]+) @("[^"]+"|[^(]+)\(`)
-	reDecl   = regexp.MustCompile(`^declare (void|[^ ]+) @("[^"]+"|[^(]+)\(([^)]*)\)(.*)$`)
-	reGlobal = regexp.MustCompile(`^@("[^"]+"|[^ ]+) = (.*?)global (%"github.com/mehdi-shokohi/cuda-ir.go/cuda\.Shared\[.*?\]") `)
+	reGlobal = regexp.MustCompile(`^@("[^"]+"|[^ ]+) = (.*?)global %"github.com/mehdi-shokohi/cuda-ir.go/cuda\.(Shared|DynShared|Constant)\[.*?\]" `)
+	// any global variable definition (not a function, not a type)
+	reAnyGlobal = regexp.MustCompile(`^@("[^"]+"|[^ ]+) = (?:[a-z_]+ )*(?:addrspace\(\d+\) )?global `)
+	reCall      = regexp.MustCompile(`call [^@]*@("[^"]+"|[A-Za-z0-9_.$/]+)\(`)
+	// heap allocation: `%3 = call ptr @"...runtime.AllocU"(i64 16)`
+	reAlloc = regexp.MustCompile(`^(\s*)(%[^ ]+) = call ptr @"` + regexp.QuoteMeta(runtimePrefix) + `internal/runtime\.(AllocU|AllocZ)"\(i64 ([^)]+)\)`)
+	// a cuda.Buf[T] parameter of a kernel: `%"...cuda.Buf[float32]" %3`
+	reBufParam = regexp.MustCompile(`(%"github.com/mehdi-shokohi/cuda-ir.go/cuda\.Buf\[[^"]*\]") %([0-9A-Za-z_.]+)`)
 )
 
 const libdevicePrefix = "__nv_"
@@ -59,6 +73,9 @@ type Options struct {
 	// SM is the compute capability passed to llc and ptxas (default sm_80).
 	// The CUDA driver JIT adapts the PTX to the GPU that is present.
 	SM string
+	// PTX is the PTX ISA version llc emits, without the dot (default "78",
+	// CUDA 11.8+; dynamic allocation needs at least "73").
+	PTX string
 	// Kernels names the functions that become kernels. Default: every
 	// exported function of the package that returns nothing.
 	Kernels []string
@@ -78,6 +95,10 @@ type Result struct {
 	Package string   // import path of the compiled package
 	PTX     []byte   // PTX text, ready for cuModuleLoadData / ctx.LoadModule
 	Kernels []string // .entry names, in definition order
+	// Globals are the exported package-level variables of the package
+	// (except cuda.Shared / DynShared), by their Go name; the host reaches
+	// them with cuModuleGetGlobal (gocudrv: mod.Global(name)).
+	Globals []string
 }
 
 // Build compiles the Go package pkg (an import path or a ./relative path)
@@ -131,6 +152,9 @@ func newBuilder(opts *Options) (*builder, error) {
 	}
 	if b.Opt == "" {
 		b.Opt = "2"
+	}
+	if b.PTX == "" {
+		b.PTX = "78"
 	}
 	var err error
 	if b.llgen, err = exec.LookPath("llgen"); err != nil {
@@ -190,7 +214,11 @@ func (b *builder) build(pkg string) (*Result, error) {
 			want[k] = true
 		}
 	}
-	fixed, found, needLibdevice, err := fixup(src, rootPkg, want)
+	dirs, err := readDirectives(pkgs[len(pkgs)-1].Dir)
+	if err != nil {
+		return nil, err
+	}
+	fixed, found, globals, needLibdevice, err := fixup(src, rootPkg, want, dirs)
 	if err != nil {
 		return nil, err
 	}
@@ -213,24 +241,37 @@ func (b *builder) build(pkg string) (*Result, error) {
 		}
 		fixedFile = withLib
 	}
-	// 4. opt
+	// 4. opt, in two steps. First inline everything: a Go function that
+	// returns &T{} now holds an alloca (see fixup), and the inliner scopes
+	// a callee's allocas with llvm.lifetime / stacksave markers that would
+	// make the memory dead as soon as the constructor returns. Those markers
+	// are stripped from the fully inlined IR before the real optimisation.
 	final := fixedFile
 	if b.Opt != "0" {
+		inlined := prefix + ".inlined.ll"
+		public := "-internalize-public-api-list=" + strings.Join(append(append([]string{}, found...), globals...), ",")
+		if err := b.llvm("opt", public, "-inline-threshold=1000000",
+			"-passes=internalize,globaldce,inline", fixedFile, "-S", "-o", inlined); err != nil {
+			return nil, err
+		}
+		if err := stripLifetimes(inlined); err != nil {
+			return nil, err
+		}
 		final = prefix + ".opt.ll"
-		// internalize everything but the kernels so unused device functions
-		// are dropped and the rest can be inlined; after inlining, turn
-		// generic loads/stores on shared/global memory into
-		// address-space-specific ones (ld.shared, ld.global)
-		if err := b.llvm("opt",
-			"-internalize-public-api-list="+strings.Join(found, ","),
+		// internalize everything but the kernels (and host-visible globals)
+		// so unused device functions are dropped and the rest can be
+		// inlined; after inlining, turn generic loads/stores on
+		// shared/global memory into address-space-specific ones
+		// (ld.shared, ld.global)
+		if err := b.llvm("opt", public,
 			"-passes=internalize,globaldce,default<O"+b.Opt+">,infer-address-spaces,instcombine,simplifycfg",
-			fixedFile, "-S", "-o", final); err != nil {
+			inlined, "-S", "-o", final); err != nil {
 			return nil, err
 		}
 	}
 	// 5. llc
 	ptxFile := prefix + ".ptx"
-	if err := b.llvm("llc", "-march=nvptx64", "-mcpu="+b.SM, final, "-o", ptxFile); err != nil {
+	if err := b.llvm("llc", "-march=nvptx64", "-mcpu="+b.SM, "-mattr=+ptx"+b.PTX, final, "-o", ptxFile); err != nil {
 		return nil, err
 	}
 	// 6. ptxas check
@@ -245,7 +286,7 @@ func (b *builder) build(pkg string) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Package: rootPkg, PTX: ptx, Kernels: found}, nil
+	return &Result{Package: rootPkg, PTX: ptx, Kernels: found, Globals: globals}, nil
 }
 
 // llvmTool finds e.g. "llc" as $LLVM_SUFFIX-suffixed, "-22", or bare.
@@ -365,6 +406,87 @@ func (b *builder) genIR(p pkgInfo) ([]byte, error) {
 	return ir, nil
 }
 
+// parseDecl splits `declare [attrs] <ret> @name(<params>)<attrs>` into
+// [_, ret, name, params, attrs] (nil if line is not a declaration). Return
+// attributes (nonnull, zeroext, ...) are dropped; the type may contain
+// spaces ({ i32, i1 }), the parameters may contain parentheses (addrspace(3)).
+func parseDecl(line string) []string {
+	if !strings.HasPrefix(line, "declare ") {
+		return nil
+	}
+	rest := line[len("declare "):]
+	at := strings.Index(rest, " @")
+	open := strings.Index(rest, "(")
+	if at < 0 || open < at {
+		return nil
+	}
+	ret := strings.TrimSpace(rest[:at])
+	for { // strip leading attribute words
+		f := strings.Fields(ret)
+		if len(f) < 2 || !isAttrWord(f[0]) {
+			break
+		}
+		ret = strings.TrimSpace(ret[len(f[0]):])
+	}
+	name := rest[at+2 : open]
+	depth, end := 0, -1
+	for i := open; i < len(rest); i++ {
+		switch rest[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return nil
+	}
+	return []string{line, ret, name, rest[open+1 : end], rest[end+1:]}
+}
+
+// nameParams turns a declaration's parameter type list ("i1, ptr") into a
+// definition's ("i1 %0, ptr %1").
+func nameParams(params string) string {
+	var out []string
+	depth, start := 0, 0
+	for i := 0; i <= len(params); i++ {
+		if i == len(params) || (params[i] == ',' && depth == 0) {
+			if t := strings.TrimSpace(params[start:i]); t != "" {
+				out = append(out, fmt.Sprintf("%s %%%d", t, len(out)))
+			}
+			start = i + 1
+			continue
+		}
+		switch params[i] {
+		case '{', '[', '(', '<':
+			depth++
+		case '}', ']', ')', '>':
+			depth--
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+// isAttrWord reports whether w is a parameter/return attribute rather than
+// the start of a type.
+func isAttrWord(w string) bool {
+	switch {
+	case w == "void", w == "ptr", w == "float", w == "double", w == "half", w == "bfloat":
+		return false
+	case strings.HasPrefix(w, "i") && len(w) > 1 && w[1] >= '0' && w[1] <= '9':
+		return false
+	case strings.HasPrefix(w, "%"), strings.HasPrefix(w, "{"), strings.HasPrefix(w, "["), strings.HasPrefix(w, "<"):
+		return false
+	}
+	return true
+}
+
 // splitName splits "pkg/path.Name" into package path and short name.
 func splitName(name string) (pkg, short string) {
 	if i := strings.LastIndex(name, "."); i >= 0 {
@@ -375,13 +497,13 @@ func splitName(name string) (pkg, short string) {
 
 // mangler maps llgo symbol names to PTX identifiers ([A-Za-z0-9_$]).
 // Kernels keep their short Go name so the host can look them up by it.
-type mangler struct{ kernels map[string]string }
+type mangler struct{ short map[string]string }
 
 func (m mangler) mangle(name string) string {
 	if strings.HasPrefix(name, "llvm.") { // intrinsics are not symbols
 		return name
 	}
-	if short, ok := m.kernels[name]; ok {
+	if short, ok := m.short[name]; ok {
 		return short
 	}
 	var b strings.Builder
@@ -448,55 +570,160 @@ func findKernels(src []byte, rootPkg string, want map[string]bool) (map[string]s
 	return kernels, nil
 }
 
-// findShared returns the package-level variables of type cuda.Shared[T];
-// they become addrspace(3) (per-block shared memory) globals.
-func findShared(src []byte) map[string]bool {
-	shared := map[string]bool{}
+// cudaGlobal is a package-level variable of a cuda.Shared / DynShared /
+// Constant type; the kind selects the address space it is placed in.
+type cudaGlobal struct{ kind string }
+
+// findCudaGlobals returns the package-level variables whose type is one of
+// the cuda memory-space wrappers.
+func findCudaGlobals(src []byte) map[string]cudaGlobal {
+	globals := map[string]cudaGlobal{}
 	scanLines(src, func(line string) error {
 		if m := reGlobal.FindStringSubmatch(line); m != nil {
-			shared[strings.Trim(m[1], `"`)] = true
+			globals[strings.Trim(m[1], `"`)] = cudaGlobal{kind: m[3]}
 		}
 		return nil
 	})
-	return shared
+	return globals
+}
+
+// addrSpace of the cuda wrapper kinds: __shared__ = 3, __constant__ = 4.
+func addrSpace(kind string) int {
+	if kind == "Constant" {
+		return 4
+	}
+	return 3
 }
 
 // fixup rewrites linked llgo IR for the NVPTX backend. It returns the
-// rewritten IR, the kernel names, and whether libdevice is needed.
-func fixup(src []byte, rootPkg string, want map[string]bool) ([]byte, []string, bool, error) {
+// rewritten IR, the kernel names, the host-visible global names, and
+// whether libdevice is needed.
+func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]directive) ([]byte, []string, []string, bool, error) {
 	kernels, err := findKernels(src, rootPkg, want)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, nil, false, err
 	}
-	shared := findShared(src)
-	m := mangler{kernels}
-	var out, found []string
+	cudaGlobals := findCudaGlobals(src)
+	short := map[string]string{} // full llgo name -> PTX name (kernels and exported globals)
+	for k, v := range kernels {
+		short[k] = v
+	}
+	m := mangler{short}
+	var out, found, globals, bodies []string
+	declared := map[string]bool{}
 	needTrap, needLibdevice := false, false
+	// pass 1: exported package-level variables of the root package keep
+	// their Go name so the host can cuModuleGetGlobal them; which runtime
+	// functions are actually called (declarations alone are harmless: type
+	// descriptors reference equality helpers that never run).
+	called := map[string]bool{}
+	scanLines(src, func(line string) error {
+		if g := reAnyGlobal.FindStringSubmatch(line); g != nil {
+			name := strings.Trim(g[1], `"`)
+			if pkg, s := splitName(name); pkg == rootPkg && isExported(s) {
+				if _, isShared := cudaGlobals[name]; !isShared || cudaGlobals[name].kind == "Constant" {
+					short[name] = s
+					globals = append(globals, s)
+				}
+			}
+		}
+		if reAlloc.MatchString(line) {
+			return nil // lowered to alloca below
+		}
+		for _, c := range reCall.FindAllStringSubmatch(line, -1) {
+			called[strings.Trim(c[1], `"`)] = true
+		}
+		return nil
+	})
+	var bufParams [][2]string // {type, name} of the Buf[T] params of the kernel being emitted
+	inKernel := false
 	err = scanLines(src, func(line string) error {
+		if inKernel {
+			switch {
+			case line == "}":
+				inKernel = false
+			case strings.HasSuffix(line, ":") && len(bufParams) > 0:
+				// entry block: rebuild the Buf[T] values from the ptr params
+				out = append(out, line)
+				for _, bp := range bufParams {
+					out = append(out, fmt.Sprintf("  %%g%[1]s = insertvalue %[2]s undef, ptr %%%[1]s, 0", bp[1], bp[0]))
+				}
+				return nil
+			default:
+				for _, bp := range bufParams {
+					line = regexp.MustCompile(`%`+regexp.QuoteMeta(bp[1])+`\b`).ReplaceAllString(line, "%g"+bp[1])
+				}
+			}
+		}
+		if a := reAlloc.FindStringSubmatch(line); a != nil {
+			// heap allocation -> stack allocation at the call site: nothing
+			// allocated in a kernel can outlive it. (Not a helper function:
+			// the inliner would end the alloca's lifetime at the return.)
+			indent, res, kind, size := a[1], a[2], a[3], a[4]
+			line = fmt.Sprintf("%s%s = alloca i8, i64 %s, align 16", indent, res, size)
+			if kind == "AllocZ" {
+				memset := fmt.Sprintf("call void @llvm.memset.p0.i64(ptr %s, i8 0, i64 %s, i1 false)", res, size)
+				bodies = append(bodies, memset)
+				line += "\n" + indent + memset
+			}
+			out = append(out, line)
+			return nil
+		}
 		switch {
 		case strings.HasPrefix(line, "target datalayout"):
 			line = nvptxDL
 		case strings.HasPrefix(line, "target triple"):
 			line = nvptxTriple
 		}
-		if d := reDecl.FindStringSubmatch(line); d != nil {
+		if d := parseDecl(line); d != nil {
 			ret, name, params, attrs := d[1], strings.Trim(d[2], `"`), d[3], d[4]
-			_, short := splitName(name)
+			_, shortName := splitName(name)
+			define := func(body string) {
+				body = strings.Replace(body, "NAME", m.mangle(name), 1)
+				body = strings.ReplaceAll(body, "%SLICE", `%"`+runtimePrefix+`internal/runtime.Slice"`)
+				bodies = append(bodies, body)
+				line = body
+			}
 			switch {
 			case strings.HasPrefix(name, runtimePrefix):
-				if ret != "void" {
+				if impl, ok := runtimeImpls[shortName]; ok {
+					define(impl)
+					break
+				}
+				if ret != "void" && called[name] {
 					return fmt.Errorf("unsupported on GPU: code depends on llgo runtime function %q (returns %s)", name, ret)
 				}
+				// panics (PanicIndex, Panic...) trap; Assert*(cond, ...)
+				// helpers trap when cond holds; a value-returning helper
+				// that is never called gets the trap body too, which is
+				// valid for any return type
 				needTrap = true
-				line = fmt.Sprintf("define void @%s(%s)%s {\n  call void @llvm.trap()\n  unreachable\n}", m.mangle(name), params, attrs)
-			case short == "init" && ret == "void" && params == "":
+				if strings.HasPrefix(shortName, "Assert") && strings.HasPrefix(params, "i1") {
+					line = fmt.Sprintf("define void @%s(%s)%s {\n  br i1 %%0, label %%t, label %%r\nt:\n  call void @llvm.trap()\n  unreachable\nr:\n  ret void\n}", m.mangle(name), nameParams(params), attrs)
+					break
+				}
+				line = fmt.Sprintf("define %s @%s(%s)%s {\n  call void @llvm.trap()\n  unreachable\n}", ret, m.mangle(name), params, attrs)
+			case shortName == "init" && ret == "void" && params == "":
 				// package initialisers of imported packages never run on the GPU
 				line = fmt.Sprintf("define void @%s()%s {\n  ret void\n}", m.mangle(name), attrs)
 			case strings.HasPrefix(name, libdevicePrefix):
 				needLibdevice = true
+			case strings.HasPrefix(name, helperPrefix):
+				body, ok := helpers[strings.TrimPrefix(name, helperPrefix)]
+				if !ok {
+					return fmt.Errorf("unknown cudair IR helper %s", name)
+				}
+				define(body)
 			case strings.HasPrefix(name, "llvm."):
+				declared[name] = true
+			case syscalls[name]:
+				// device-runtime syscalls provided by the driver (vprintf)
 			default:
-				return fmt.Errorf("unsupported on GPU: call to %s — the Go standard library is not available in kernels; use package cuda (math -> cuda.Sqrt/Sin/..., sync/atomic is fine)", name)
+				if body, ok := stdlibImpls[name]; ok {
+					define(body)
+					break
+				}
+				return fmt.Errorf("unsupported on GPU: call to %s — the Go standard library is not available in kernels; use package cuda (math -> cuda.Sqrt/Sin/..., sync/atomic and math/bits are fine)", name)
 			}
 		}
 		if d := reDefine.FindStringSubmatch(line); d != nil {
@@ -505,29 +732,54 @@ func fixup(src []byte, rootPkg string, want map[string]bool) ([]byte, []string, 
 			if strings.HasPrefix(d[1], "linkonce ") {
 				line = strings.Replace(line, "define linkonce ", "define linkonce_odr ", 1)
 			}
-			if short, ok := kernels[strings.Trim(d[3], `"`)]; ok {
+			if s, ok := kernels[strings.Trim(d[3], `"`)]; ok {
+				// Buf[T] parameters become plain `ptr` parameters (the same
+				// 8-byte .param for the host); llc then knows they point
+				// into global memory and emits ld.global / st.global instead
+				// of generic loads and stores. The body sees the struct again
+				// from the entry block on.
+				inKernel, bufParams = true, nil
+				for _, m := range reBufParam.FindAllStringSubmatch(line, -1) {
+					bufParams = append(bufParams, [2]string{m[1], m[2]})
+				}
+				line = reBufParam.ReplaceAllString(line, "ptr %$2")
 				line = strings.Replace(line, "define "+d[1], "define "+d[1]+"ptx_kernel ", 1)
-				found = append(found, short)
+				if dir, ok := dirs[s]; ok {
+					line = strings.Replace(line, ") #", ") "+dir.attrs()+" #", 1)
+				}
+				found = append(found, s)
 			}
 		}
-		// cuda.Shared[T] globals: definition moves to addrspace(3); every use
-		// goes through an addrspacecast back to a generic pointer.
+		// cuda.Shared / DynShared / Constant globals: the definition moves to
+		// its address space; every use goes through an addrspacecast back
+		// to a generic pointer (infer-address-spaces folds them away).
 		if g := reGlobal.FindStringSubmatch(line); g != nil {
-			line = strings.Replace(line, "global "+g[3], "addrspace(3) global "+g[3], 1)
-			line = strings.Replace(line, "zeroinitializer", "undef", 1)
-		} else if len(shared) > 0 {
+			name := strings.Trim(g[1], `"`)
+			switch g[3] {
+			case "DynShared":
+				// extern __shared__: size comes from the launch (SharedMemBytes)
+				line = fmt.Sprintf("@%s = external addrspace(3) global [0 x i8], align 16", m.mangle(name))
+			case "Constant":
+				line = strings.Replace(line, "global %", "addrspace(4) global %", 1)
+			default:
+				line = strings.Replace(line, "global %", "addrspace(3) global %", 1)
+				line = strings.Replace(line, "zeroinitializer", "undef", 1)
+			}
+		} else if len(cudaGlobals) > 0 {
+			cast := func(name string) string {
+				return fmt.Sprintf("addrspacecast (ptr addrspace(%d) @%s to ptr)", addrSpace(cudaGlobals[name].kind), m.mangle(name))
+			}
 			line = reQuoted.ReplaceAllStringFunc(line, func(s string) string {
-				name := s[2 : len(s)-1]
-				if !shared[name] {
-					return s
+				if name := s[2 : len(s)-1]; cudaGlobals[name].kind != "" {
+					return cast(name)
 				}
-				return fmt.Sprintf("addrspacecast (ptr addrspace(3) @%s to ptr)", m.mangle(name))
+				return s
 			})
 			line = reBare.ReplaceAllStringFunc(line, func(s string) string {
-				if !shared[s[1:]] {
-					return s
+				if cudaGlobals[s[1:]].kind != "" {
+					return cast(s[1:])
 				}
-				return fmt.Sprintf("addrspacecast (ptr addrspace(3) @%s to ptr)", m.mangle(s[1:]))
+				return s
 			})
 		}
 		line = reQuoted.ReplaceAllStringFunc(line, func(s string) string { return "@" + m.mangle(s[2:len(s)-1]) })
@@ -536,12 +788,39 @@ func fixup(src []byte, rootPkg string, want map[string]bool) ([]byte, []string, 
 		return nil
 	})
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, nil, false, err
 	}
 	if needTrap {
-		out = append(out, "", "declare void @llvm.trap()")
+		bodies = append(bodies, "call void @llvm.trap()")
 	}
-	return []byte(strings.Join(out, "\n") + "\n"), found, needLibdevice, nil
+	sort.Strings(globals)
+	out = append(out, "")
+	out = append(out, intrinsicDecls(bodies, declared)...)
+	out = append(out, invariantMD+" = !{}")
+	return []byte(strings.Join(out, "\n") + "\n"), found, globals, needLibdevice, nil
+}
+
+// syscalls are functions the CUDA driver provides to device code.
+var syscalls = map[string]bool{"vprintf": true}
+
+// stripLifetimes removes the llvm.lifetime.* and stacksave/stackrestore
+// calls the inliner added for callee allocas, in place.
+func stripLifetimes(file string) error {
+	src, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	var out []string
+	scanLines(src, func(line string) error {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "call void @llvm.lifetime.") || strings.HasPrefix(t, "call void @llvm.stackrestore") ||
+			strings.Contains(t, "= call ptr @llvm.stacksave") {
+			return nil
+		}
+		out = append(out, line)
+		return nil
+	})
+	return os.WriteFile(file, []byte(strings.Join(out, "\n")+"\n"), 0o644)
 }
 
 // libdevicePath finds NVIDIA's libdevice bitcode (math functions), or "".

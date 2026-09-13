@@ -15,7 +15,7 @@ import (
 // TestVecAdd is the README sample: compile examples/vecadd to PTX in-process,
 // launch VecAdd through gocudrv and check out = a + b.
 func TestVecAdd(t *testing.T) {
-	ctx, mod := loadKernels(t, "github.com/mehdi-shokohi/cuda-ir.go/examples/vecadd")
+	ctx, mod, _ := loadKernels(t, "github.com/mehdi-shokohi/cuda-ir.go/examples/vecadd")
 	k, err := mod.Function("VecAdd")
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestVecAdd(t *testing.T) {
 // shared memory + __syncthreads + warp shuffle + float atomics (BlockSum),
 // sync/atomic + warp votes (Count), libdevice math (Math), clock64 (Timing).
 func TestFeatures(t *testing.T) {
-	ctx, mod := loadKernels(t, "github.com/mehdi-shokohi/cuda-ir.go/examples/features")
+	ctx, mod, _ := loadKernels(t, "github.com/mehdi-shokohi/cuda-ir.go/examples/features")
 	bg := context.Background()
 
 	const n = 1 << 16
@@ -167,7 +167,7 @@ func TestFeatures(t *testing.T) {
 
 // loadKernels compiles pkg to PTX in-process and loads it on device 0.
 // Skips the test when no CUDA driver / device is present.
-func loadKernels(t *testing.T, pkg string) (*cuda.Context, *cuda.Module) {
+func loadKernels(t *testing.T, pkg string) (*cuda.Context, *cuda.Module, *cudair.Result) {
 	t.Helper()
 	if os.Getenv("LLGO_ROOT") == "" {
 		os.Setenv("LLGO_ROOT", findLLGoRoot())
@@ -195,7 +195,23 @@ func loadKernels(t *testing.T, pkg string) (*cuda.Context, *cuda.Module) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { mod.Close() })
-	return ctx, mod
+	return ctx, mod, res
+}
+
+// download copies a device buffer into a new slice.
+func download[T cuda.Supported](t *testing.T, d *cuda.Buffer[T]) []T {
+	t.Helper()
+	out := make([]T, d.Len())
+	if err := d.CopyTo(context.Background(), out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// near reports whether got is within tol (absolute + relative) of want.
+func near(got, want, tol float64) bool {
+	d := math.Abs(got - want)
+	return d <= tol || d <= tol*math.Abs(want)
 }
 
 // upload allocates a device buffer of len(src) and copies src into it.

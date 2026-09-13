@@ -1,7 +1,7 @@
 // gocuda build compiles a Go package of kernels to PTX; the same pipeline
 // is available from Go as package cudair (github.com/mehdi-shokohi/cuda-ir.go).
 //
-//	gocuda build [-o out.ptx] [-sm sm_80] [-kernel A,B] [-O 2] [-keep] [-v] ./pkg
+//	gocuda build [-o out.ptx] [-sm sm_80] [-ptx 78] [-kernel A,B] [-O 2] [-keep] [-v] ./pkg
 //	gocuda doctor            # check that every tool gocuda needs is installed
 package main
 
@@ -24,12 +24,13 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 || os.Args[1] != "build" {
-		fmt.Fprintln(os.Stderr, "usage: gocuda build [-o out.ptx] [-sm sm_80] [-kernel A,B] [-O 2] [-keep] [-v] ./pkg\n       gocuda doctor")
+		fmt.Fprintln(os.Stderr, "usage: gocuda build [-o out.ptx] [-sm sm_80] [-ptx 78] [-kernel A,B] [-O 2] [-keep] [-v] ./pkg\n       gocuda doctor")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	outFile := fs.String("o", "", "output .ptx (default <pkg>.ptx in the current directory)")
 	sm := fs.String("sm", "sm_80", "target compute capability for llc/ptxas")
+	ptxVer := fs.String("ptx", "78", "PTX ISA version to emit (73 minimum)")
 	kernelList := fs.String("kernel", "", "comma-separated kernel names (default: all exported void funcs of the package)")
 	optLevel := fs.String("O", "2", "opt level passed to opt (0 to skip)")
 	keep := fs.Bool("keep", false, "keep intermediate .ll files next to the output")
@@ -43,7 +44,7 @@ func main() {
 	if os.Getenv("LLGO_ROOT") == "" {
 		fmt.Fprintln(os.Stderr, "gocuda: warning: LLGO_ROOT is not set; llgen may fail")
 	}
-	opts := &cudair.Options{SM: *sm, Opt: *optLevel, NoCheck: !*check}
+	opts := &cudair.Options{SM: *sm, PTX: *ptxVer, Opt: *optLevel, NoCheck: !*check}
 	if *kernelList != "" {
 		opts.Kernels = strings.Split(*kernelList, ",")
 	}

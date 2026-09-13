@@ -1,38 +1,86 @@
 package cuda
 
-import _ "unsafe" // for go:linkname
+import "unsafe"
 
 // ---- block barriers
 
+// barrier{.cta}.sync.aligned id[, count] / .arrive / .red.{and,or,popc}
+// (LLVM 22 names; the old llvm.nvvm.barrier0 family is auto-upgraded to these)
+
+//go:linkname barrierAll llvm.nvvm.barrier.cta.sync.aligned.all
+func barrierAll(id int32)
+
+//go:linkname barrierCount llvm.nvvm.barrier.cta.sync.aligned.count
+func barrierCount(id, count int32)
+
+//go:linkname barrierArrive llvm.nvvm.barrier.cta.arrive.aligned.count
+func barrierArrive(id, count int32)
+
+//go:linkname barrierAnd llvm.nvvm.barrier.cta.red.and.aligned.all
+func barrierAnd(id int32, p bool) bool
+
+//go:linkname barrierOr llvm.nvvm.barrier.cta.red.or.aligned.all
+func barrierOr(id int32, p bool) bool
+
+//go:linkname barrierPopc llvm.nvvm.barrier.cta.red.popc.aligned.all
+func barrierPopc(id int32, p bool) int32
+
 // SyncThreads is __syncthreads().
-//
-//go:linkname SyncThreads llvm.nvvm.barrier0
-func SyncThreads()
-
-//go:linkname barrierAnd llvm.nvvm.barrier0.and
-func barrierAnd(p int32) int32
-
-//go:linkname barrierOr llvm.nvvm.barrier0.or
-func barrierOr(p int32) int32
-
-//go:linkname barrierPopc llvm.nvvm.barrier0.popc
-func barrierPopc(p int32) int32
-
-func b2i(p bool) int32 {
-	if p {
-		return 1
-	}
-	return 0
-}
+func SyncThreads() { barrierAll(0) }
 
 // SyncThreadsAnd is __syncthreads_and(pred).
-func SyncThreadsAnd(pred bool) bool { return barrierAnd(b2i(pred)) != 0 }
+func SyncThreadsAnd(pred bool) bool { return barrierAnd(0, pred) }
 
 // SyncThreadsOr is __syncthreads_or(pred).
-func SyncThreadsOr(pred bool) bool { return barrierOr(b2i(pred)) != 0 }
+func SyncThreadsOr(pred bool) bool { return barrierOr(0, pred) }
 
 // SyncThreadsCount is __syncthreads_count(pred).
-func SyncThreadsCount(pred bool) int32 { return barrierPopc(b2i(pred)) }
+func SyncThreadsCount(pred bool) int32 { return barrierPopc(0, pred) }
+
+// SyncBarrier is `bar.sync id, count`: a named barrier (id 1..15; 0 is
+// __syncthreads) that only `count` threads (a multiple of 32) take part in,
+// for producer/consumer patterns within a block.
+func SyncBarrier(id, count int32) { barrierCount(id, count) }
+
+// ArriveBarrier is `bar.arrive id, count`: signal the named barrier without
+// waiting on it (the producer side; consumers use SyncBarrier).
+func ArriveBarrier(id, count int32) { barrierArrive(id, count) }
+
+// NanoSleep is __nanosleep(ns) (sm_70+): suspend the thread for about ns.
+//
+//go:linkname NanoSleep llvm.nvvm.nanosleep
+func NanoSleep(ns uint32)
+
+// Trap is __trap(): abort the kernel; the launch fails with an error.
+//
+//go:linkname Trap llvm.trap
+func Trap()
+
+// Breakpoint is __brkpt().
+//
+//go:linkname Breakpoint llvm.debugtrap
+func Breakpoint()
+
+// Assume is __builtin_assume(cond): an optimisation hint; undefined
+// behaviour if cond is false.
+//
+//go:linkname Assume llvm.assume
+func Assume(cond bool)
+
+// IsGlobal/IsShared/IsConstant/IsLocal are __isGlobal & co: which memory
+// space a generic pointer points into.
+//
+//go:linkname IsGlobal llvm.nvvm.isspacep.global
+func IsGlobal(p unsafe.Pointer) bool
+
+//go:linkname IsShared llvm.nvvm.isspacep.shared
+func IsShared(p unsafe.Pointer) bool
+
+//go:linkname IsConstant llvm.nvvm.isspacep.const
+func IsConstant(p unsafe.Pointer) bool
+
+//go:linkname IsLocal llvm.nvvm.isspacep.local
+func IsLocal(p unsafe.Pointer) bool
 
 // SyncWarp is __syncwarp(mask).
 //
@@ -105,6 +153,10 @@ func shflBflyF32(mask uint32, v float32, lanemask int32, c int32) float32
 // __shfl_* helpers do: up uses 0, the others 0x1f (warp width 32).
 const shflUpC, shflC = 0, 0x1f
 
+// shflCWidth is the c operand for a sub-warp segment of `width` lanes
+// (CUDA's `width` argument, a power of two <= 32).
+func shflCWidth(width int32, c int32) int32 { return ((32 - width) << 8) | c }
+
 // Shfl is __shfl_sync: value of v from lane srcLane.
 func Shfl(mask uint32, v int32, srcLane int32) int32 { return shflIdxI32(mask, v, srcLane, shflC) }
 
@@ -155,3 +207,131 @@ func Ballot(mask uint32, pred bool) uint32 { return voteBallot(mask, pred) }
 
 // ActiveMask is __activemask().
 func ActiveMask() uint32 { return activeMask() }
+
+// ---- shuffles with a segment width (CUDA's `width` argument)
+
+// ShflWidth is __shfl_sync(mask, v, srcLane, width).
+func ShflWidth(mask uint32, v int32, srcLane, width int32) int32 {
+	return shflIdxI32(mask, v, srcLane, shflCWidth(width, shflC))
+}
+
+// ShflUpWidth is __shfl_up_sync(mask, v, delta, width).
+func ShflUpWidth(mask uint32, v int32, delta, width int32) int32 {
+	return shflUpI32(mask, v, delta, shflCWidth(width, shflUpC))
+}
+
+// ShflDownWidth is __shfl_down_sync(mask, v, delta, width).
+func ShflDownWidth(mask uint32, v int32, delta, width int32) int32 {
+	return shflDownI32(mask, v, delta, shflCWidth(width, shflC))
+}
+
+// ShflXorWidth is __shfl_xor_sync(mask, v, laneMask, width).
+func ShflXorWidth(mask uint32, v int32, laneMask, width int32) int32 {
+	return shflBflyI32(mask, v, laneMask, shflCWidth(width, shflC))
+}
+
+// ---- 64-bit shuffles: two 32-bit shuffles, as CUDA's headers do
+
+func split64(v int64) (lo, hi int32) { return int32(uint32(v)), int32(uint32(uint64(v) >> 32)) }
+func join64(lo, hi int32) int64      { return int64(uint64(uint32(hi))<<32 | uint64(uint32(lo))) }
+
+// Shfl64 is __shfl_sync for 64-bit values.
+func Shfl64(mask uint32, v int64, srcLane int32) int64 {
+	lo, hi := split64(v)
+	return join64(Shfl(mask, lo, srcLane), Shfl(mask, hi, srcLane))
+}
+
+// ShflUp64 is __shfl_up_sync for 64-bit values.
+func ShflUp64(mask uint32, v int64, delta int32) int64 {
+	lo, hi := split64(v)
+	return join64(ShflUp(mask, lo, delta), ShflUp(mask, hi, delta))
+}
+
+// ShflDown64 is __shfl_down_sync for 64-bit values.
+func ShflDown64(mask uint32, v int64, delta int32) int64 {
+	lo, hi := split64(v)
+	return join64(ShflDown(mask, lo, delta), ShflDown(mask, hi, delta))
+}
+
+// ShflXor64 is __shfl_xor_sync for 64-bit values.
+func ShflXor64(mask uint32, v int64, laneMask int32) int64 {
+	lo, hi := split64(v)
+	return join64(ShflXor(mask, lo, laneMask), ShflXor(mask, hi, laneMask))
+}
+
+// ShflF64 & co are the float64 variants.
+func ShflF64(mask uint32, v float64, srcLane int32) float64 {
+	return Float64FromBits(uint64(Shfl64(mask, int64(Float64Bits(v)), srcLane)))
+}
+func ShflUpF64(mask uint32, v float64, delta int32) float64 {
+	return Float64FromBits(uint64(ShflUp64(mask, int64(Float64Bits(v)), delta)))
+}
+func ShflDownF64(mask uint32, v float64, delta int32) float64 {
+	return Float64FromBits(uint64(ShflDown64(mask, int64(Float64Bits(v)), delta)))
+}
+func ShflXorF64(mask uint32, v float64, laneMask int32) float64 {
+	return Float64FromBits(uint64(ShflXor64(mask, int64(Float64Bits(v)), laneMask)))
+}
+
+// ---- match / reduce (sm_70+ / sm_80+)
+
+//go:linkname matchAnyI32 llvm.nvvm.match.any.sync.i32
+func matchAnyI32(mask uint32, v int32) uint32
+
+//go:linkname matchAnyI64 llvm.nvvm.match.any.sync.i64
+func matchAnyI64(mask uint32, v int64) uint32
+
+//go:linkname matchAllI32 llvm.nvvm.match.all.sync.i32p
+func matchAllI32(mask uint32, v int32) (uint32, bool)
+
+//go:linkname matchAllI64 llvm.nvvm.match.all.sync.i64p
+func matchAllI64(mask uint32, v int64) (uint32, bool)
+
+// MatchAny is __match_any_sync (sm_70+): the mask of lanes in `mask` that
+// hold the same value of v as this lane.
+func MatchAny(mask uint32, v int32) uint32 { return matchAnyI32(mask, v) }
+
+// MatchAny64 is __match_any_sync for 64-bit values.
+func MatchAny64(mask uint32, v int64) uint32 { return matchAnyI64(mask, v) }
+
+// MatchAll is __match_all_sync (sm_70+): mask if all lanes in `mask` hold
+// the same v (and pred = true), else 0 and pred = false.
+func MatchAll(mask uint32, v int32) (m uint32, pred bool) { return matchAllI32(mask, v) }
+
+// MatchAll64 is __match_all_sync for 64-bit values.
+func MatchAll64(mask uint32, v int64) (m uint32, pred bool) { return matchAllI64(mask, v) }
+
+//go:linkname reduxAdd llvm.nvvm.redux.sync.add
+func reduxAdd(v int32, mask uint32) int32
+
+//go:linkname reduxMin llvm.nvvm.redux.sync.min
+func reduxMin(v int32, mask uint32) int32
+
+//go:linkname reduxMax llvm.nvvm.redux.sync.max
+func reduxMax(v int32, mask uint32) int32
+
+//go:linkname reduxUMin llvm.nvvm.redux.sync.umin
+func reduxUMin(v uint32, mask uint32) uint32
+
+//go:linkname reduxUMax llvm.nvvm.redux.sync.umax
+func reduxUMax(v uint32, mask uint32) uint32
+
+//go:linkname reduxAnd llvm.nvvm.redux.sync.and
+func reduxAnd(v uint32, mask uint32) uint32
+
+//go:linkname reduxOr llvm.nvvm.redux.sync.or
+func reduxOr(v uint32, mask uint32) uint32
+
+//go:linkname reduxXor llvm.nvvm.redux.sync.xor
+func reduxXor(v uint32, mask uint32) uint32
+
+// ReduceAdd is __reduce_add_sync (sm_80+): the sum of v over the lanes in
+// mask, returned to every one of them. Min/Max/MinU/MaxU/And/Or/Xor likewise.
+func ReduceAdd(mask uint32, v int32) int32    { return reduxAdd(v, mask) }
+func ReduceMin(mask uint32, v int32) int32    { return reduxMin(v, mask) }
+func ReduceMax(mask uint32, v int32) int32    { return reduxMax(v, mask) }
+func ReduceMinU(mask uint32, v uint32) uint32 { return reduxUMin(v, mask) }
+func ReduceMaxU(mask uint32, v uint32) uint32 { return reduxUMax(v, mask) }
+func ReduceAnd(mask uint32, v uint32) uint32  { return reduxAnd(v, mask) }
+func ReduceOr(mask uint32, v uint32) uint32   { return reduxOr(v, mask) }
+func ReduceXor(mask uint32, v uint32) uint32  { return reduxXor(v, mask) }
