@@ -1,0 +1,5 @@
+*.ptx
+*.ll
+*.cubin
+llgo_autogen.ll
+/gocuda
