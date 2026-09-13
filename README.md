@@ -303,3 +303,10 @@ llgo has no NVPTX target; its output needs these rewrites (`cudair.Build` / `goc
 ## Tested on
 
 RTX 5060 Laptop (sm_120), driver 580 / CUDA 13.1, LLVM 22.1.8, llgo v1.0.2+, Go 1.27.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). The pipeline builds on
+[llgo](https://github.com/xgo-dev/llgo) and LLVM (Apache-2.0) and
+[gocudrv](https://github.com/eitamring/gocudrv) (MIT); `libdevice.10.bc` is read from
+the user's CUDA toolkit and is not redistributed.
