@@ -126,17 +126,29 @@ func cpAsyncBulkG2S(dst, src unsafe.Pointer, bytes int32, bar unsafe.Pointer)
 func cpAsyncBulkS2G(dst, src unsafe.Pointer, bytes int32)
 
 // CpAsyncBulkG2S is cp.async.bulk.shared::cluster.global (TMA, sm_90+):
-// copy `bytes` (a multiple of 16) from global src to shared dst, both
-// 16-byte aligned, completing on bar's transaction count (see
+// copy n elements (n*sizeof(T) a multiple of 16) from global src to shared
+// dst, both 16-byte aligned, completing on bar's transaction count (see
 // MBarrier.ArriveExpectTx). Issued by one thread.
-func CpAsyncBulkG2S(dst, src unsafe.Pointer, bytes int32, bar *MBarrier) {
-	cpAsyncBulkG2S(dst, src, bytes, unsafe.Pointer(bar))
+//
+//	cuda.CpAsyncBulkG2S(&tile[0], in.Ptr(base), 256, bar)
+func CpAsyncBulkG2S[T any](dst, src *T, n int32, bar *MBarrier) {
+	cpAsyncBulkG2S(unsafe.Pointer(dst), unsafe.Pointer(src), n*int32(unsafe.Sizeof(*dst)), unsafe.Pointer(bar))
 }
 
-// CpAsyncBulkS2G is cp.async.bulk.global.shared::cta: copy `bytes` from
+// CpAsyncBulkS2G is cp.async.bulk.global.shared::cta: copy n elements from
 // shared src to global dst, tracked by bulk groups (CpAsyncBulkCommit +
 // CpAsyncBulkWait0).
-func CpAsyncBulkS2G(dst, src unsafe.Pointer, bytes int32) { cpAsyncBulkS2G(dst, src, bytes) }
+func CpAsyncBulkS2G[T any](dst, src *T, n int32) {
+	cpAsyncBulkS2G(unsafe.Pointer(dst), unsafe.Pointer(src), n*int32(unsafe.Sizeof(*dst)))
+}
+
+// Bytes is n elements of T in bytes, for MBarrier.ArriveExpectTx:
+//
+//	bar.ArriveExpectTx(cuda.Bytes[float32](256))
+func Bytes[T any](n int32) int32 {
+	var v T
+	return n * int32(unsafe.Sizeof(v))
+}
 
 // CpAsyncBulkCommit is cp.async.bulk.commit_group.
 //

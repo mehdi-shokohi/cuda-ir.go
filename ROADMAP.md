@@ -91,7 +91,11 @@ tested on sm_120) and `TestBlackwell` (`examples/blackwell`, `-sm sm_100a -ptx 8
 
 Also on the way: `parser.ParseDir` (deprecated in Go 1.25) replaced by per-file parsing in
 `directives.go`; IR helpers may carry their own `declare` lines (needed for aggregate-returning
-intrinsics, deduplicated against llgo's declarations).
+intrinsics, deduplicated against llgo's declarations); no `unsafe` in kernels any more — every
+pointer-taking API is generic over `*T` (`CpAsync`, `CpAsyncBulkG2S/S2G`, `IsGlobal…`,
+`MapShared`, `Ldg`, `VolatileLoad/Store`, `LoadHint/StoreHint`) with `Buf[T]` methods
+(`Ldg`, `Volatile/SetVolatile`, `Load/Store(i, hint)`, `View`) and `cuda.As[U](p)` for
+reinterpreting an element.
 
 ## v0.5 — next
 

@@ -14,6 +14,8 @@
 - **Go semantics on the GPU.** Nil derefs and out-of-range indexes become a PTX `trap`; anything that needs
   the Go runtime is a compile error, not a silent crash.
 
+The simplest kernel — one thread per element:
+
 ```go
 package kernels
 
@@ -42,9 +44,62 @@ ctx.Synchronize(bg)
 dout.CopyTo(bg, out)
 ```
 
+The same language reaches the whole device API. A tensor-core matrix multiply
+(`nvcuda::wmma` in CUDA C) fed by TMA bulk copies is still just Go — this is
+`examples/hopper.MatMul16`, checked against a CPU matmul by `go test -run TestHopper`:
+
+```go
+package kernels
+
+import "github.com/mehdi-shokohi/cuda-ir.go/cuda"
+
+var bar cuda.Shared[cuda.MBarrier]       // __shared__ cuda::barrier
+var tile cuda.Shared[[16 * 16]cuda.Half] // __shared__ __half tile[256]
+
+// MatMul16: C = A * B + C for n x n row-major matrices, one 32-thread block
+// (a warp) per 16x16 output tile, grid (n/16, n/16). Each A tile is streamed
+// into shared memory with TMA (cp.async.bulk) completing on an mbarrier,
+// then multiplied on the tensor cores with wmma. Build with -sm sm_90.
+//
+//cuda:restrict
+//cuda:launch_bounds 32
+func MatMul16(a, b cuda.Buf[cuda.Half], c cuda.Buf[float32], n int32) {
+	row, col := cuda.BlockIdxY(), cuda.BlockIdxX()
+	mb, t := bar.Get(), tile.Get()
+	if cuda.ThreadIdxX() == 0 {
+		mb.Init(1)
+		cuda.FenceMBarrierInit()
+	}
+	cuda.SyncThreads()
+
+	acc := cuda.WmmaLoadC(c.Ptr(row*16*n+col*16), n) // wmma::load_matrix_sync(c_frag, ...)
+	for k, phase := int32(0), int32(0); k < n; k, phase = k+16, phase^1 {
+		if cuda.ThreadIdxX() == 0 { // one thread issues the tile's bulk copy, row by row
+			mb.ArriveExpectTx(cuda.Bytes[cuda.Half](16 * 16))
+			for r := int32(0); r < 16; r++ {
+				cuda.CpAsyncBulkG2S(&t[r*16], a.Ptr((row*16+r)*n+k), 16, mb)
+			}
+		}
+		mb.WaitParity(phase) // the tile has landed
+		fa := cuda.WmmaLoadA(&t[0], 16)
+		fb := cuda.WmmaLoadB(b.Ptr(k*n+col*16), n)
+		acc = cuda.WmmaMma(fa, fb, acc) // wmma::mma_sync
+		cuda.FenceProxyAsyncShared()    // our reads of the tile are ordered before the next TMA write
+		cuda.SyncThreads()
+	}
+	cuda.WmmaStore(c.Ptr(row*16*n+col*16), n, acc) // wmma::store_matrix_sync
+}
+```
+
+Everything in it has a CUDA C twin: `//cuda:restrict` is `__restrict__`, `cuda.Shared` is
+`__shared__`, `MBarrier` is `cuda::barrier`, `CpAsyncBulkG2S` is `cp.async.bulk`, the
+`Wmma*` calls are `nvcuda::wmma`. The [Device API](#device-api-cuda-c--package-cuda) table
+lists the rest.
+
+
 To try it: `make deps` installs everything the compiler needs (LLVM 22, the llgo
 checkout + `llgen`, `gocuda`), then `make test` runs the examples on your GPU — see
-[Installation](#installation). The full runnable version of the snippet above is
+[Installation](#installation). The full runnable version of the VecAdd snippet is
 `main_test.go` (`go test -run TestVecAdd -v .`).
 
 The same compiler is a command for build-time use:
@@ -235,8 +290,9 @@ Options:
 | `&T{}`, `copy()`, `for range`, local arrays that escape, plain function values | stack-allocated (nothing outlives the kernel), `memmove`, indirect `call` |
 | `fmt`, any other stdlib, `make`, `append`, maps, strings ops, interfaces, goroutines, `defer`, closures | **compile error** (need the Go runtime) |
 
-`Buf[T].At/Set` are unchecked like C; indexing Go arrays and slices is bounds-checked.
-`cuda.Printf` is the device `printf`.
+`Buf[T].At/Set` are unchecked like C; `Buf[T].View(off, n)` is a bounds-checked `[]T` over the
+buffer; indexing Go arrays and slices is bounds-checked. Every device API takes typed `*T`
+pointers — kernels never need `unsafe`. `cuda.Printf` is the device `printf`.
 
 ## Device API (CUDA C ↔ package cuda)
 
@@ -266,10 +322,10 @@ All verified on hardware by `go test .` (`examples/features`, `examples/intrinsi
 | `atomicInc/atomicDec` | `AtomicInc/AtomicDec` |
 | `atomicAdd_block / atomicAdd_system` | `AtomicAddInt32/64Block`, `AtomicAddInt32/64System` |
 | `cuda::atomic_ref` `load(acquire)` / `store(release)` | `LoadAcquireInt32/64`, `StoreReleaseInt32/64` |
-| `volatile T*` | `VolatileLoad/StoreInt32/Int64/Float32/Float64` |
-| `__ldg(p)` | `LdgF32/F64/I32/I64` (→ `ld.global.nc`) |
+| `volatile T*` | `buf.Volatile(i)` / `buf.SetVolatile(i, v)`, `VolatileLoad/Store(p)`, `VolatileLoadInt32…` |
+| `__ldg(p)` | `buf.Ldg(i)`, `Ldg(p)`, `LdgF32/F64/I32/I64` (→ `ld.global.nc`) |
 | `float4/int4` loads and stores | `LoadFloat4/StoreFloat4`, `LoadInt4/StoreInt4` |
-| `cp.async` / `__pipeline_memcpy_async` (sm_80) | `CpAsync4/8/16`, `CpAsync16CG`, `CpAsyncCommit`, `CpAsyncWait1/2`, `CpAsyncWaitAll` |
+| `cp.async` / `__pipeline_memcpy_async` (sm_80) | `CpAsync(dst, src *T)`, `CpAsyncCG`, `CpAsyncCommit`, `CpAsyncWait1/2`, `CpAsyncWaitAll` |
 | `__half`, `__nv_bfloat16` (+ `__hadd/__hmul/__hfma` …) | `cuda.Half`, `cuda.BFloat16` (`FloatToHalf`, `.Float32()`, `.Add/Sub/Mul/Div/FMA`) |
 | `__popc/__popcll __clz/__clzll __ffs/__ffsll __brev/__brevll` | `Popc/Popc64 Clz/Clz64 Ffs/Ffs64 Brev/Brev64` (or `math/bits`) |
 | `__byte_perm __funnelshift_l/r __mulhi/__umulhi/__mul64hi/__umul64hi __mul24/__umul24 __sad/__usad __hadd/__rhadd/__uhadd` | `BytePerm FunnelShiftL/R MulHi/MulHiU/MulHi64/MulHiU64 Mul24/Mul24U Sad/SadU HAdd/RHAdd/HAddU` |
@@ -283,17 +339,17 @@ All verified on hardware by `go test .` (`examples/features`, `examples/intrinsi
 | `__float_as_uint / __uint_as_float / __double_as_longlong` | `Float32Bits Float32FromBits Float64Bits Float64FromBits` (or `math.Float32bits`) |
 | `clock() clock64() globaltimer`, `__nanosleep(ns)` | `Clock() Clock64() GlobalTimer()`, `NanoSleep(ns)` |
 | `__trap() __brkpt() __builtin_assume(c)` | `Trap() Breakpoint() Assume(c)` |
-| `__isGlobal/__isShared/__isConstant/__isLocal` | `IsGlobal/IsShared/IsConstant/IsLocal(p)` |
+| `__isGlobal/__isShared/__isConstant/__isLocal` | `IsGlobal/IsShared/IsConstant/IsLocal(p *T)` |
 | `printf(fmt, ...)` | `Printf(fmt, Args().Int(i).Float(x)...)` |
 | `%pm0..%pm3` | `PerfCounter0..3()` |
 | `wmma::load_matrix_sync / mma_sync / store_matrix_sync` (m16n16k16, half → float) | `WmmaLoadA[Col]/WmmaLoadB[Col]/WmmaLoadC[Col]`, `WmmaMma[RowCol/ColRow/ColCol]`, `WmmaStore[Col]`, `FragA/FragB/FragC` (`Fill`, `Elems`) |
 | `tex1D/tex2D/tex3D<float4>`, `tex2D<int4/uint4>`, `tex1Dfetch`, `txq` | `Tex1D Tex2D Tex3D Tex2DInt Tex2DUint Tex1DFetch TexWidth TexHeight` on a `cuda.Texture` |
 | `surf1Dread/write`, `surf2Dread/write` (32-bit) | `Surf1D/Surf2D{Read,Write}{Int32,Float32}` on a `cuda.Surface` |
-| `__ldca/__ldcg/__ldcs/__ldlu/__ldcv`, `__stwb/__stcg/__stcs/__stwt` | `LoadCA/CG/CS/LU/CV{Int32,Int64,Float32,Float64}`, `StoreWB/CG/CS/WT{…}` |
+| `__ldca/__ldcg/__ldcs/__ldlu/__ldcv`, `__stwb/__stcg/__stcs/__stwt` | `buf.Load(i, cuda.CG)` / `buf.Store(i, v, cuda.CS)` (hints `CA CG CS LU CV WB WT`), `LoadHint/StoreHint(p, …)`, `LoadCG{Int32,…}` … |
 | `this_thread_block()`, `tiled_partition<N>`, `coalesced_threads()`, `thread_rank/size/sync/shfl/ballot`, `cg::reduce` | `ThisBlock()`, `ThisWarp()`, `TiledPartition(n)`, `CoalescedThreads()` → `Block` / `Tile` methods |
-| `cluster.sync()`, `barrier.cluster.arrive/wait`, `%clusterid %cluster_ctarank %cluster_nctarank …`, `cluster.map_shared_rank(p, r)` (sm_90) | `ClusterSync/Arrive/Wait`, `ClusterIDX… ClusterCtaRank ClusterSize NumClustersX… ClusterBlockIdxX… ClusterDimX…`, `Shared[T].InCluster(rank)`, `MapShared`, `IsSharedCluster`, `ThreadFenceCluster` |
+| `cluster.sync()`, `barrier.cluster.arrive/wait`, `%clusterid %cluster_ctarank %cluster_nctarank …`, `cluster.map_shared_rank(p, r)` (sm_90) | `ClusterSync/Arrive/Wait`, `ClusterIDX… ClusterCtaRank ClusterSize NumClustersX… ClusterBlockIdxX… ClusterDimX…`, `Shared[T].InCluster(rank)`, `MapShared(p, rank)`, `IsSharedCluster(p)`, `ThreadFenceCluster` |
 | `mbarrier.init/arrive/arrive_drop/test_wait/inval` (sm_80), `arrive.expect_tx/expect_tx/try_wait.parity` (sm_90) | `cuda.MBarrier` in shared memory: `Init Arrive ArriveDrop Wait TestWait ArriveExpectTx ExpectTx WaitParity TryWaitParity Inval`, `PendingCount`, `FenceMBarrierInit` |
-| TMA `cp.async.bulk` global ↔ shared, `commit_group / wait_group[.read]`, `fence.proxy.async` (sm_90) | `CpAsyncBulkG2S(dst, src, bytes, bar)`, `CpAsyncBulkS2G`, `CpAsyncBulkCommit`, `CpAsyncBulkWait0/1`, `CpAsyncBulkWaitRead0/1`, `FenceProxyAsyncShared` |
+| TMA `cp.async.bulk` global ↔ shared, `commit_group / wait_group[.read]`, `fence.proxy.async` (sm_90) | `CpAsyncBulkG2S(dst, src *T, n, bar)`, `CpAsyncBulkS2G`, `Bytes[T](n)`, `CpAsyncBulkCommit`, `CpAsyncBulkWait0/1`, `CpAsyncBulkWaitRead0/1`, `FenceProxyAsyncShared` |
 | `elect.sync` (sm_90) | `ElectSync(mask) (leader, elected)` |
 | `griddepcontrol.wait / launch_dependents` (sm_90) | `GridDepWait()`, `GridDepLaunchDependents()` |
 | `__reduce_min/max_sync(float)` (sm_100a) | `ReduceMinF32/MaxF32` (build with `-sm sm_100a -ptx 86`) |
@@ -331,7 +387,7 @@ go test -v .     # the README VecAdd sample as a Go test (main_test.go)
   groups sugar, `%pm` counters
 - `examples/hopper` (`go test -run TestHopper`, sm_90, needs a compute capability ≥ 9.0 GPU) —
   thread block clusters + distributed shared memory, `mbarrier`, TMA bulk copies,
-  `elect.sync`, `griddepcontrol`
+  `elect.sync`, `griddepcontrol`, and `MatMul16`, the README's TMA-fed tensor-core matmul
 - `examples/blackwell` (`go test -run TestBlackwell`, sm_100a) — `redux.sync` on floats;
   compiled everywhere, executed on a 10.x GPU
 

@@ -1,6 +1,6 @@
 package cuda
 
-import _ "unsafe" // for go:linkname
+import "unsafe"
 
 // ---- cache-hint loads and stores (__ldca/__ldcg/__ldcs/__ldlu/__ldcv,
 // __stwb/__stcg/__stcs/__stwt): the pointer must be global memory.
@@ -172,3 +172,100 @@ func StoreWTInt32(p *int32, v int32)       { storeWTI32(p, v) }
 func StoreWTInt64(p *int64, v int64)       { storeWTI64(p, v) }
 func StoreWTFloat32(p *float32, v float32) { storeWTF32(p, v) }
 func StoreWTFloat64(p *float64, v float64) { storeWTF64(p, v) }
+
+// CacheHint selects the cache operator of Buf.Load / Buf.Store (CUDA's
+// __ldca/__ldcg/… and __stwb/__stcg/…).
+type CacheHint int
+
+const (
+	CA CacheHint = iota // loads: cache at all levels (the default)
+	CG                  // loads and stores: cache in L2 only, bypass L1
+	CS                  // loads and stores: streaming, evict first
+	LU                  // loads: last use
+	CV                  // loads: do not cache, fetch again (volatile)
+	WB                  // stores: write back (the default)
+	WT                  // stores: write through to system memory
+)
+
+// LoadHint loads *p (a global pointer to a 4- or 8-byte element) with the
+// cache hint; other element sizes get a plain load.
+func LoadHint[T any](p *T, hint CacheHint) T {
+	var v T
+	switch unsafe.Sizeof(v) {
+	case 4:
+		q := (*int32)(unsafe.Pointer(p))
+		var r int32
+		switch hint {
+		case CG:
+			r = loadCGI32(q)
+		case CS:
+			r = loadCSI32(q)
+		case LU:
+			r = loadLUI32(q)
+		case CV:
+			r = loadCVI32(q)
+		default:
+			r = loadCAI32(q)
+		}
+		*(*int32)(unsafe.Pointer(&v)) = r
+	case 8:
+		q := (*int64)(unsafe.Pointer(p))
+		var r int64
+		switch hint {
+		case CG:
+			r = loadCGI64(q)
+		case CS:
+			r = loadCSI64(q)
+		case LU:
+			r = loadLUI64(q)
+		case CV:
+			r = loadCVI64(q)
+		default:
+			r = loadCAI64(q)
+		}
+		*(*int64)(unsafe.Pointer(&v)) = r
+	default:
+		v = *p
+	}
+	return v
+}
+
+// StoreHint stores v to *p (a global pointer to a 4- or 8-byte element)
+// with the cache hint; other element sizes get a plain store.
+func StoreHint[T any](p *T, v T, hint CacheHint) {
+	switch unsafe.Sizeof(v) {
+	case 4:
+		q, w := (*int32)(unsafe.Pointer(p)), *(*int32)(unsafe.Pointer(&v))
+		switch hint {
+		case CG:
+			storeCGI32(q, w)
+		case CS:
+			storeCSI32(q, w)
+		case WT:
+			storeWTI32(q, w)
+		default:
+			storeWBI32(q, w)
+		}
+	case 8:
+		q, w := (*int64)(unsafe.Pointer(p)), *(*int64)(unsafe.Pointer(&v))
+		switch hint {
+		case CG:
+			storeCGI64(q, w)
+		case CS:
+			storeCSI64(q, w)
+		case WT:
+			storeWTI64(q, w)
+		default:
+			storeWBI64(q, w)
+		}
+	default:
+		*p = v
+	}
+}
+
+// Load / Store are b.At(i) / b.Set(i, v) with a cache hint:
+//
+//	v := in.Load(i, cuda.CG)      // __ldcg(&in[i])
+//	out.Store(i, v, cuda.CS)      // __stcs(&out[i], v)
+func (b Buf[T]) Load(i int32, hint CacheHint) T     { return LoadHint(b.Ptr(i), hint) }
+func (b Buf[T]) Store(i int32, v T, hint CacheHint) { StoreHint(b.Ptr(i), v, hint) }

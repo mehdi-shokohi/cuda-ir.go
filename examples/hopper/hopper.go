@@ -1,14 +1,11 @@
 // Package hopper exercises the sm_90 features: thread block clusters with
 // distributed shared memory, mbarrier, bulk asynchronous copies (TMA),
-// elect.sync and programmatic dependent launch. Build with -sm sm_90
-// -ptx 80 (cudair.Options{SM: "sm_90", PTX: "80"}).
+// elect.sync, programmatic dependent launch and the README's TMA-fed
+// tensor-core matmul. Build with -sm sm_90 -ptx 80
+// (cudair.Options{SM: "sm_90", PTX: "80"}).
 package hopper
 
-import (
-	"unsafe"
-
-	"github.com/mehdi-shokohi/cuda-ir.go/cuda"
-)
+import "github.com/mehdi-shokohi/cuda-ir.go/cuda"
 
 const blockSize = 256
 
@@ -75,7 +72,6 @@ var tmaBar cuda.Shared[cuda.MBarrier]
 // cp.async.bulk (completion on an mbarrier), doubles it, and bulk-copies
 // it back to out. n is a multiple of blockSize.
 func TmaDouble(in, out cuda.Buf[int32], n int32) {
-	const bytes = blockSize * 4
 	b := tmaBar.Get()
 	t := tmaTile.Get()
 	tid := cuda.ThreadIdxX()
@@ -89,15 +85,15 @@ func TmaDouble(in, out cuda.Buf[int32], n int32) {
 	}
 	cuda.SyncThreads()
 	if tid == 0 {
-		b.ArriveExpectTx(bytes)
-		cuda.CpAsyncBulkG2S(unsafe.Pointer(t), unsafe.Pointer(in.Ptr(base)), bytes, b)
+		b.ArriveExpectTx(cuda.Bytes[int32](blockSize))
+		cuda.CpAsyncBulkG2S(&t[0], in.Ptr(base), blockSize, b)
 	}
 	b.WaitParity(0) // the tile has landed
 	t[tid] *= 2
 	cuda.FenceProxyAsyncShared() // make the generic-proxy writes visible to TMA
 	cuda.SyncThreads()
 	if tid == 0 {
-		cuda.CpAsyncBulkS2G(unsafe.Pointer(out.Ptr(base)), unsafe.Pointer(t), bytes)
+		cuda.CpAsyncBulkS2G(out.Ptr(base), &t[0], blockSize)
 		cuda.CpAsyncBulkCommit()
 		cuda.CpAsyncBulkWait0()
 	}
@@ -128,4 +124,43 @@ func GridDep(out cuda.Buf[int32]) {
 	out.Set(i, i)
 	cuda.GridDepLaunchDependents()
 	cuda.ThreadFenceCluster()
+}
+
+// ---- the README sample: TMA-fed tensor-core matmul
+
+var mmBar cuda.Shared[cuda.MBarrier]       // __shared__ cuda::barrier
+var mmTile cuda.Shared[[16 * 16]cuda.Half] // __shared__ __half tile[256]
+
+// MatMul16: C = A * B + C for n x n row-major matrices, one 32-thread block
+// (a warp) per 16x16 output tile, grid (n/16, n/16). Each A tile is streamed
+// into shared memory with TMA (cp.async.bulk) completing on an mbarrier,
+// then multiplied on the tensor cores with wmma. Build with -sm sm_90.
+//
+//cuda:restrict
+//cuda:launch_bounds 32
+func MatMul16(a, b cuda.Buf[cuda.Half], c cuda.Buf[float32], n int32) {
+	row, col := cuda.BlockIdxY(), cuda.BlockIdxX()
+	mb, t := mmBar.Get(), mmTile.Get()
+	if cuda.ThreadIdxX() == 0 {
+		mb.Init(1)
+		cuda.FenceMBarrierInit()
+	}
+	cuda.SyncThreads()
+
+	acc := cuda.WmmaLoadC(c.Ptr(row*16*n+col*16), n) // wmma::load_matrix_sync(c_frag, ...)
+	for k, phase := int32(0), int32(0); k < n; k, phase = k+16, phase^1 {
+		if cuda.ThreadIdxX() == 0 { // one thread issues the tile's bulk copy, row by row
+			mb.ArriveExpectTx(cuda.Bytes[cuda.Half](16 * 16))
+			for r := int32(0); r < 16; r++ {
+				cuda.CpAsyncBulkG2S(&t[r*16], a.Ptr((row*16+r)*n+k), 16, mb)
+			}
+		}
+		mb.WaitParity(phase) // the tile has landed
+		fa := cuda.WmmaLoadA(&t[0], 16)
+		fb := cuda.WmmaLoadB(b.Ptr(k*n+col*16), n)
+		acc = cuda.WmmaMma(fa, fb, acc) // wmma::mma_sync
+		cuda.FenceProxyAsyncShared()    // our reads of the tile are ordered before the next TMA write
+		cuda.SyncThreads()
+	}
+	cuda.WmmaStore(c.Ptr(row*16*n+col*16), n, acc) // wmma::store_matrix_sync
 }

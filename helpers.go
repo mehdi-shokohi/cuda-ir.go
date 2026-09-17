@@ -52,7 +52,7 @@ func init() {
 			"define %[1]s @NAME(ptr %%p, %[1]s %%v) {\n  %%r = atomicrmw fadd ptr %%p, %[1]s %%v seq_cst, align %[2]d\n  ret %[1]s %%r\n}", ty, size(ty))
 	}
 	// volatile and read-only (__ldg, ld.global.nc) loads, volatile stores
-	for _, ty := range []string{"i32", "i64", "float", "double"} {
+	for _, ty := range []string{"i8", "i16", "i32", "i64", "float", "double"} {
 		helpers["load.volatile."+ty] = fmt.Sprintf(
 			"define %[1]s @NAME(ptr %%p) {\n  %%r = load volatile %[1]s, ptr %%p, align %[2]d\n  ret %[1]s %%r\n}", ty, size(ty))
 		helpers["store.volatile."+ty] = fmt.Sprintf(
@@ -165,6 +165,8 @@ func size(ty string) int {
 		return 8
 	case "i16", "half", "bfloat":
 		return 2
+	case "i8":
+		return 1
 	}
 	return 4
 }

@@ -97,7 +97,7 @@ func mapa(p unsafe.Pointer, rank int32) unsafe.Pointer
 
 // MapShared is cluster.map_shared_rank(p, rank): the address of the same
 // shared-memory variable in the cluster block with the given rank.
-func MapShared(p unsafe.Pointer, rank int32) unsafe.Pointer { return mapa(p, rank) }
+func MapShared[T any](p *T, rank int32) *T { return (*T)(mapa(unsafe.Pointer(p), rank)) }
 
 // InCluster returns the block of rank `rank`'s instance of this shared
 // variable (distributed shared memory). Synchronise with ClusterSync
@@ -105,10 +105,11 @@ func MapShared(p unsafe.Pointer, rank int32) unsafe.Pointer { return mapa(p, ran
 // is not released while a peer still accesses it.
 func (s *Shared[T]) InCluster(rank int32) *T { return (*T)(mapa(unsafe.Pointer(&s.v), rank)) }
 
+//go:linkname isSharedCluster llvm.nvvm.isspacep.shared.cluster
+func isSharedCluster(p unsafe.Pointer) bool
+
 // IsSharedCluster is __isClusterShared(p).
-//
-//go:linkname IsSharedCluster llvm.nvvm.isspacep.shared.cluster
-func IsSharedCluster(p unsafe.Pointer) bool
+func IsSharedCluster[T any](p *T) bool { return isSharedCluster(unsafe.Pointer(p)) }
 
 //go:linkname fenceAcqRelCluster cudair.fence.acq_rel.cluster
 func fenceAcqRelCluster()

@@ -136,22 +136,20 @@ func LocalCopy(in, out cuda.Buf[float32], p Params) {
 
 // CacheHints: out[i] = 4*in[i] read with every float load hint and written
 // with every store hint (the last store wins); iout = 2*iin, lout = 2*lin,
-// dout = 2*din likewise. The pointers must be global memory.
+// dout = 2*din likewise, through the Buf methods and the typed functions.
+// The pointers must be global memory.
 func CacheHints(in, out cuda.Buf[float32], iin, iout cuda.Buf[int32], lin, lout cuda.Buf[int64], din, dout cuda.Buf[float64], n int32) {
 	i := cuda.GlobalIdX()
 	if i >= n {
 		return
 	}
-	p := in.Ptr(i)
-	v := cuda.LoadCAFloat32(p) + cuda.LoadCGFloat32(p) + cuda.LoadCSFloat32(p) + cuda.LoadCVFloat32(p)
-	q := out.Ptr(i)
-	cuda.StoreWBFloat32(q, 0)
-	cuda.StoreCGFloat32(q, 1)
-	cuda.StoreWTFloat32(q, 2)
-	cuda.StoreCSFloat32(q, v)
-	ip := iin.Ptr(i)
-	cuda.StoreCSInt32(iout.Ptr(i), cuda.LoadCGInt32(ip)+cuda.LoadLUInt32(ip))
-	lp := lin.Ptr(i)
+	v := in.Load(i, cuda.CA) + in.Load(i, cuda.CG) + in.Load(i, cuda.CS) + in.Load(i, cuda.CV)
+	out.Store(i, 0, cuda.WB)
+	out.Store(i, 1, cuda.CG)
+	out.Store(i, 2, cuda.WT)
+	out.Store(i, v, cuda.CS)
+	iout.Store(i, iin.Load(i, cuda.CG)+iin.Load(i, cuda.LU), cuda.CS)
+	lp := lin.Ptr(i) // the typed functions take raw pointers
 	cuda.StoreWBInt64(lout.Ptr(i), cuda.LoadCSInt64(lp)+cuda.LoadCAInt64(lp))
 	dp := din.Ptr(i)
 	cuda.StoreCGFloat64(dout.Ptr(i), cuda.LoadCVFloat64(dp)+cuda.LoadLUFloat64(dp))

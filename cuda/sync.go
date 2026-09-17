@@ -67,20 +67,24 @@ func Breakpoint()
 //go:linkname Assume llvm.assume
 func Assume(cond bool)
 
+//go:linkname isGlobal llvm.nvvm.isspacep.global
+func isGlobal(p unsafe.Pointer) bool
+
+//go:linkname isShared llvm.nvvm.isspacep.shared
+func isShared(p unsafe.Pointer) bool
+
+//go:linkname isConstant llvm.nvvm.isspacep.const
+func isConstant(p unsafe.Pointer) bool
+
+//go:linkname isLocal llvm.nvvm.isspacep.local
+func isLocal(p unsafe.Pointer) bool
+
 // IsGlobal/IsShared/IsConstant/IsLocal are __isGlobal & co: which memory
-// space a generic pointer points into.
-//
-//go:linkname IsGlobal llvm.nvvm.isspacep.global
-func IsGlobal(p unsafe.Pointer) bool
-
-//go:linkname IsShared llvm.nvvm.isspacep.shared
-func IsShared(p unsafe.Pointer) bool
-
-//go:linkname IsConstant llvm.nvvm.isspacep.const
-func IsConstant(p unsafe.Pointer) bool
-
-//go:linkname IsLocal llvm.nvvm.isspacep.local
-func IsLocal(p unsafe.Pointer) bool
+// space a pointer points into.
+func IsGlobal[T any](p *T) bool   { return isGlobal(unsafe.Pointer(p)) }
+func IsShared[T any](p *T) bool   { return isShared(unsafe.Pointer(p)) }
+func IsConstant[T any](p *T) bool { return isConstant(unsafe.Pointer(p)) }
+func IsLocal[T any](p *T) bool    { return isLocal(unsafe.Pointer(p)) }
 
 // SyncWarp is __syncwarp(mask).
 //

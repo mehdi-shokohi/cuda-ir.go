@@ -249,9 +249,10 @@ func TestAdvanced(t *testing.T) {
 	})
 
 	t.Run("CacheHints", func(t *testing.T) { // ld.global.{ca,cg,cs,lu,cv} / st.global.{wb,cg,cs,wt}
-		for _, want := range []string{"ld.global.ca.f32", "ld.global.cg.f32", "ld.global.cs.f32", "ld.global.cv.f32", "ld.global.cg.b32", "ld.global.lu.b32",
-			"ld.global.cs.b64", "ld.global.ca.b64", "ld.global.cv.f64", "ld.global.lu.f64",
-			"st.global.wb.f32", "st.global.cg.f32", "st.global.wt.f32", "st.global.cs.f32", "st.global.cs.b32", "st.global.wb.b64", "st.global.cg.f64"} {
+		// Buf.Load/Store move the bits (b32); the typed *float64 functions use f64
+		for _, want := range []string{"ld.global.ca.b32", "ld.global.cg.b32", "ld.global.cs.b32", "ld.global.lu.b32", "ld.global.cv.b32",
+			"st.global.wb.b32", "st.global.cg.b32", "st.global.wt.b32", "st.global.cs.b32",
+			"ld.global.cs.b64", "ld.global.ca.b64", "ld.global.cv.f64", "ld.global.lu.f64", "st.global.wb.b64", "st.global.cg.f64"} {
 			if !strings.Contains(ptx, want) {
 				t.Fatalf("PTX lacks %q", want)
 			}
@@ -450,6 +451,37 @@ func TestHopper(t *testing.T) {
 			}
 		}
 		fmt.Printf("Elect: one lane elected per warp, leader lane = %d\n", leader[0])
+	})
+
+	t.Run("MatMul16", func(t *testing.T) { // the README sample: TMA-fed wmma matmul
+		const n = 64
+		a, b := make([]uint16, n*n), make([]uint16, n*n)
+		af, bf, c := make([]float32, n*n), make([]float32, n*n), make([]float32, n*n)
+		for i := 0; i < n; i++ {
+			for j := 0; j < n; j++ {
+				af[i*n+j], bf[i*n+j], c[i*n+j] = float32((i+2*j)%7-3), float32((3*i+j)%5-2), float32(j-i)
+				a[i*n+j], b[i*n+j] = float32ToHalf(af[i*n+j]), float32ToHalf(bf[i*n+j])
+			}
+		}
+		want := make([]float32, n*n)
+		for i := 0; i < n; i++ {
+			for j := 0; j < n; j++ {
+				s := c[i*n+j]
+				for k := 0; k < n; k++ {
+					s += af[i*n+k] * bf[k*n+j]
+				}
+				want[i*n+j] = s
+			}
+		}
+		da, db, dc := upload(t, ctx, a), upload(t, ctx, b), upload(t, ctx, c)
+		launch(t, ctx, mod, "MatMul16", cuda.LaunchConfig{GridX: n / 16, GridY: n / 16, GridZ: 1, BlockX: 32, BlockY: 1, BlockZ: 1},
+			cuda.Arg(da), cuda.Arg(db), cuda.Arg(dc), cuda.ArgValue(int32(n)))
+		for i, v := range download(t, dc) {
+			if v != want[i] {
+				t.Fatalf("C[%d][%d] = %v, want %v", i/n, i%n, v, want[i])
+			}
+		}
+		fmt.Printf("MatMul16: %dx%d TMA-fed tensor-core matmul (the README sample) matches the CPU\n", n, n)
 	})
 
 	t.Run("GridDep", func(t *testing.T) { // griddepcontrol.wait / launch_dependents (no-ops without PDL)

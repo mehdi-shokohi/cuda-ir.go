@@ -7,7 +7,6 @@ import (
 	"math"
 	"math/bits"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/mehdi-shokohi/cuda-ir.go/cuda"
 )
@@ -146,9 +145,9 @@ func Barriers(out cuda.Buf[int32]) {
 		out.Set(b*8+1, cnt)
 		out.Set(b*8+2, b2i(and))
 		out.Set(b*8+3, b2i(or))
-		out.Set(b*8+4, b2i(cuda.IsShared(unsafe.Pointer(&t[0]))))
-		out.Set(b*8+5, b2i(cuda.IsGlobal(unsafe.Pointer(out.Ptr(0)))))
-		out.Set(b*8+6, b2i(cuda.IsShared(unsafe.Pointer(out.Ptr(0)))))
+		out.Set(b*8+4, b2i(cuda.IsShared(&t[0])))
+		out.Set(b*8+5, b2i(cuda.IsGlobal(out.Ptr(0))))
+		out.Set(b*8+6, b2i(cuda.IsShared(out.Ptr(0))))
 		out.Set(b*8+7, 1)
 	}
 }
@@ -172,13 +171,13 @@ func Atomics(vals cuda.Buf[int32], out32 cuda.Buf[int32], out64 cuda.Buf[int64],
 	v := vals.At(i)
 	cuda.AtomicMinInt32(out32.Ptr(0), v)
 	cuda.AtomicMaxInt32(out32.Ptr(1), v)
-	cuda.AtomicMinUint32((*uint32)(unsafe.Pointer(out32.Ptr(2))), uint32(v))
-	cuda.AtomicMaxUint32((*uint32)(unsafe.Pointer(out32.Ptr(3))), uint32(v))
+	cuda.AtomicMinUint32(cuda.As[uint32](out32.Ptr(2)), uint32(v))
+	cuda.AtomicMaxUint32(cuda.As[uint32](out32.Ptr(3)), uint32(v))
 	cuda.AtomicAddInt32System(out32.Ptr(4), 1)
 	cuda.AtomicAddInt32Block(out32.Ptr(8+cuda.BlockIdxX()), 1)
 	cuda.AtomicMinInt64(out64.Ptr(0), int64(v)*1000000)
 	cuda.AtomicMaxInt64(out64.Ptr(1), int64(v)*1000000)
-	cuda.AtomicMaxUint64((*uint64)(unsafe.Pointer(out64.Ptr(2))), uint64(int64(v)))
+	cuda.AtomicMaxUint64(cuda.As[uint64](out64.Ptr(2)), uint64(int64(v)))
 	f := float32(v) * 0.5
 	cuda.AtomicSwapFloat32(outf.Ptr(0), f)
 	for { // atomicMax on floats via CAS, the classic pattern

@@ -4,11 +4,7 @@
 // half precision, cp.async and a grid-wide barrier.
 package memory
 
-import (
-	"unsafe"
-
-	"github.com/mehdi-shokohi/cuda-ir.go/cuda"
-)
+import "github.com/mehdi-shokohi/cuda-ir.go/cuda"
 
 const blockSize = 256
 
@@ -93,8 +89,7 @@ func PanicCopy(in, out cuda.Buf[float32], n, bad int32) {
 		panic("bad input")
 	}
 	var win [4]float32
-	src := unsafe.Slice(in.Ptr(i&^3), 4) // the aligned window of 4 around i
-	copy(win[:], src)
+	copy(win[:], in.View(i&^3, 4)) // the aligned window of 4 around i
 	var s float32
 	for _, v := range win {
 		s += v
@@ -138,8 +133,8 @@ func Ldg(in cuda.Buf[float32], idx cuda.Buf[int32], out cuda.Buf[float32], n int
 	if i >= n {
 		return
 	}
-	j := cuda.LdgI32(idx.Ptr(i))
-	out.Set(i, cuda.LdgF32(in.Ptr(i))+cuda.LdgF32(in.Ptr(j)))
+	j := idx.Ldg(i)
+	out.Set(i, in.Ldg(i)+cuda.LdgF32(in.Ptr(j)))
 }
 
 // Volatile: thread 0 of the block publishes a value with a volatile store
@@ -151,9 +146,9 @@ func Volatile(flag cuda.Buf[int32], out cuda.Buf[int32], n int32) {
 	}
 	b := cuda.BlockIdxX()
 	if cuda.ThreadIdxX() == 0 {
-		cuda.VolatileStoreInt32(flag.Ptr(b), b+1)
+		flag.SetVolatile(b, b+1)
 	}
-	for cuda.VolatileLoadInt32(flag.Ptr(b)) == 0 {
+	for flag.Volatile(b) == 0 {
 	}
 	out.Set(i, cuda.VolatileLoadInt32(flag.Ptr(b)))
 }
@@ -185,7 +180,7 @@ func CpAsyncReverse(in, out cuda.Buf[float32], n int32) {
 	tid := cuda.ThreadIdxX()
 	i := cuda.GlobalIdX()
 	if i < n {
-		cuda.CpAsync4(unsafe.Pointer(&t[tid]), unsafe.Pointer(in.Ptr(i)))
+		cuda.CpAsync(&t[tid], in.Ptr(i))
 	}
 	cuda.CpAsyncCommit()
 	cuda.CpAsyncWaitAll()
