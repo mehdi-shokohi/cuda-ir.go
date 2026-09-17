@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/eitamring/gocudrv/cuda"
@@ -283,4 +284,49 @@ func findLLGoRoot() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, "llgo")
+}
+
+// TestSharedTypeUnification: a cuda.Shared whose layout equals another
+// struct's (FragC) is still placed in __shared__ after llvm-link unified
+// the type names, and every block gets its own copy.
+func TestSharedTypeUnification(t *testing.T) {
+	res := buildKernels(t, "github.com/mehdi-shokohi/cuda-ir.go/examples/features", nil)
+	ptx := string(res.PTX)
+	if !strings.Contains(ptx, ".shared .align 16 .b8 github_com_mehdi_shokohi_cuda_ir_go_examples_features_scratch[32]") {
+		t.Fatalf("scratch is not __shared__:\n%s", grepLines(ptx, "features_scratch"))
+	}
+	ctx, mod, _ := loadKernels(t, "github.com/mehdi-shokohi/cuda-ir.go/examples/features")
+	bg := context.Background()
+	const blocks, n = 512, 512 * 256
+	x := make([]float32, n)
+	for i := range x {
+		x[i] = float32(i / 32 % 7) // constant within a warp: warp w of block b sums to 32*((b*8+w)%7)
+	}
+	in, out := upload(t, ctx, x), upload(t, ctx, make([]float32, blocks*8))
+	fn, err := mod.Function("WarpSums")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fn.Launch(bg, cuda.LaunchConfig{GridX: blocks, GridY: 1, GridZ: 1, BlockX: 256, BlockY: 1, BlockZ: 1}, cuda.Arg(in), cuda.Arg(out), cuda.ArgValue(int32(n))); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]float32, blocks*8)
+	if err := out.CopyTo(bg, got); err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range got {
+		if want := float32(32 * (i % 7)); v != want {
+			t.Fatalf("out[%d] = %v, want %v (blocks share scratch?)", i, v, want)
+		}
+	}
+}
+
+func grepLines(s, sub string) string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if strings.Contains(l, sub) {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
 }

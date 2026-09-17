@@ -198,12 +198,19 @@ func (b *builder) build(pkg string) (*Result, error) {
 	}
 	prefix := filepath.Join(b.WorkDir, path.Base(rootPkg))
 
-	// 1. llgen each package
+	// 1. llgen each package. The cuda.Shared / DynShared / Constant
+	// variables are recognised here, per package, by their Go type name:
+	// llvm-link unifies structurally identical named types, so after
+	// linking a `cuda.Shared[[8]float32]` may be typed `cuda.FragC`.
 	var lls []string
+	cudaGlobals := map[string]cudaGlobal{}
 	for _, p := range pkgs {
 		ir, err := b.genIR(p)
 		if err != nil {
 			return nil, err
+		}
+		for name, g := range findCudaGlobals(ir) {
+			cudaGlobals[name] = g
 		}
 		dst := fmt.Sprintf("%s.%s.ll", prefix, mangler{}.mangle(p.ImportPath))
 		if err := os.WriteFile(dst, ir, 0o644); err != nil {
@@ -231,7 +238,7 @@ func (b *builder) build(pkg string) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	fixed, found, globals, needLibdevice, err := fixup(src, rootPkg, want, dirs)
+	fixed, found, globals, needLibdevice, err := fixup(src, rootPkg, want, dirs, cudaGlobals)
 	if err != nil {
 		return nil, err
 	}
@@ -608,15 +615,21 @@ func addrSpace(kind string) int {
 	return 3
 }
 
-// fixup rewrites linked llgo IR for the NVPTX backend. It returns the
-// rewritten IR, the kernel names, the host-visible global names, and
-// whether libdevice is needed.
-func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]directive) ([]byte, []string, []string, bool, error) {
+// fixup rewrites linked llgo IR for the NVPTX backend. cudaGlobals are
+// the cuda memory-space variables found in the per-package IR. It
+// returns the rewritten IR, the kernel names, the host-visible global
+// names, and whether libdevice is needed.
+func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]directive, cudaGlobals map[string]cudaGlobal) ([]byte, []string, []string, bool, error) {
 	kernels, err := findKernels(src, rootPkg, want)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	cudaGlobals := findCudaGlobals(src)
+	if cudaGlobals == nil {
+		cudaGlobals = map[string]cudaGlobal{}
+	}
+	for name, g := range findCudaGlobals(src) {
+		cudaGlobals[name] = g
+	}
 	short := map[string]string{} // full llgo name -> PTX name (kernels and exported globals)
 	for k, v := range kernels {
 		short[k] = v
@@ -835,9 +848,9 @@ func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]dir
 		// cuda.Shared / DynShared / Constant globals: the definition moves to
 		// its address space; every use goes through an addrspacecast back
 		// to a generic pointer (infer-address-spaces folds them away).
-		if g := reGlobal.FindStringSubmatch(line); g != nil {
+		if g := reAnyGlobal.FindStringSubmatch(line); g != nil && cudaGlobals[strings.Trim(g[1], `"`)].kind != "" {
 			name := strings.Trim(g[1], `"`)
-			switch g[3] {
+			switch cudaGlobals[name].kind {
 			case "DynShared":
 				// extern __shared__: size comes from the launch (SharedMemBytes)
 				line = fmt.Sprintf("@%s = external addrspace(3) global [0 x i8], align 16", m.mangle(name))

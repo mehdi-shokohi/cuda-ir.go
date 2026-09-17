@@ -12,6 +12,34 @@ const blockSize = 256
 
 var tile cuda.Shared[[blockSize]float32]
 
+// scratch has the layout of cuda.FragC ({ [8 x float] }); llvm-link unifies
+// the two named types, and the compiler must still place it in __shared__
+// (TestSharedTypeUnification).
+var scratch cuda.Shared[[8]float32]
+
+// WarpSums writes the sum of each warp of a block into out[warp] through
+// scratch; every block writes its own row. Launch grid n/256, block 256.
+func WarpSums(in cuda.Buf[float32], out cuda.Buf[float32], n int32) {
+	s := scratch.Get()
+	tid := cuda.ThreadIdxX()
+	var v float32
+	if i := cuda.GlobalIdX(); i < n {
+		v = in.At(i)
+	}
+	for off := int32(16); off > 0; off >>= 1 {
+		v += cuda.ShflDownF32(cuda.FullMask, v, off)
+	}
+	if cuda.LaneID() == 0 {
+		s[tid/32] = v
+	}
+	cuda.SyncThreads()
+	if tid < 8 {
+		out.Set(cuda.BlockIdxX()*8+tid, s[tid])
+	}
+	var c cuda.FragC // keeps the FragC type in this module
+	_ = c
+}
+
 // BlockSum reduces each block of `in` with shared memory + __syncthreads,
 // then a warp shuffle for the last 32, and atomically adds to out[0].
 func BlockSum(in cuda.Buf[float32], out cuda.Buf[float32], n int32) {
