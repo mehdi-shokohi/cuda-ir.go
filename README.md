@@ -394,6 +394,17 @@ go test -v .     # the README VecAdd sample as a Go test (main_test.go)
 Each `run/main.go` calls `cudair.Build` by default; `-ptx file` loads a pre-built
 PTX instead, `-v` prints the compiler commands.
 
+## Used by
+
+- [gollama.cu](https://github.com/mehdi-shokohi/gollama.cu) — llama.cpp-style LLM inference
+  in Go whose CUDA kernels are Go too, compiled by `gocuda build` to an embedded PTX.
+  Eleven kernels (RMSNorm, RoPE, softmax, dequantizing Q4_0 / Q4_K / Q6_K matrix-vector
+  products, grouped-query attention) run Llama 3.2 3B and Llama 3.1 8B from GGUF files and
+  reproduce ollama's greedy output. Every kernel has a pure-Go twin it is tested against,
+  which is how it found the shared-memory type-unification bug fixed in `8aed2e0`. Its
+  [docs/03-kernels.md](https://github.com/mehdi-shokohi/gollama.cu/blob/main/docs/03-kernels.md)
+  is a tutorial on writing real kernels with this compiler.
+
 ## What the compiler does to llgo's IR
 
 llgo has no NVPTX target; its output needs these rewrites (`cudair.Build` / `gocuda build`) before `llc`/`ptxas` accept it:
