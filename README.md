@@ -2,8 +2,9 @@
 
 `cuda-ir.go` lets you write CUDA kernels in plain Go and run them on NVIDIA GPUs — no C, no nvcc, no cgo.
 
-- **Kernels are Go functions.** `threadIdx`, `__shared__`, `__syncthreads`, warp shuffles, atomics and
-  libdevice math are all a `cuda.*` call away; `sync/atomic` just works.
+- **Kernels are Go functions.** `threadIdx`, `__shared__`, `__syncthreads`, warp shuffles, atomics,
+  libdevice math, tensor cores, textures, clusters and TMA are all a `cuda.*` call away;
+  `sync/atomic` just works.
 - **Go → PTX.** [llgo](https://github.com/xgo-dev/llgo) lowers the package to LLVM IR; `cudair` rewrites it
   for the NVPTX backend and hands it to `llc`. The CUDA driver JITs the PTX for whatever GPU is present.
 - **Compile in-process or ahead of time.** `cudair.Build("./kernels", nil)` gives you PTX bytes at run time;
@@ -224,6 +225,10 @@ Options:
 | `var C = cuda.Constant[[4]float32]{V: ...}` (exported) | `__constant__`; host: `mod.Global("C")` + `cuda.WriteGlobal` |
 | exported package-level `var X int32` | `__device__` global; host reads/writes it by name, `res.Globals` lists them |
 | `//cuda:launch_bounds 256 2`, `//cuda:maxnreg 32` doc comment | `__launch_bounds__(256, 2)`, `__maxnreg__(32)` |
+| `//cuda:cluster_dims 2 [1 [1]]` doc comment (sm_90) | `__cluster_dims__(2, 1, 1)` — launched with the plain grid, a multiple of the cluster |
+| `//cuda:restrict` doc comment | `__restrict__` on every pointer parameter (`noalias`; read-only ones become `ld.global.nc`) |
+| `//cuda:grid_constant` doc comment | `__grid_constant__` on every struct parameter: `&p` points into parameter space, no local copy; do not write to it |
+| `cuda.Texture` / `cuda.Surface` parameter | `cudaTextureObject_t` / `cudaSurfaceObject_t` — pass gocudrv's `cuda.ArgTexture` / `cuda.ArgSurface` |
 | `sync/atomic` on device pointers | native `atom.*` instructions |
 | `cuda.Sqrt/Sin/Exp/...`, `math.Sqrt/Float32bits/...`, `math/bits.*` | PTX instruction or libdevice |
 | `panic(...)`, nil deref, index out of range, integer `/ 0` | PTX `trap` → the launch fails with an error |
@@ -235,7 +240,8 @@ Options:
 
 ## Device API (CUDA C ↔ package cuda)
 
-All verified on hardware by `go test .` (`examples/features`, `examples/intrinsics`, `examples/memory`).
+All verified on hardware by `go test .` (`examples/features`, `examples/intrinsics`, `examples/memory`,
+`examples/advanced`, `examples/hopper`; `examples/blackwell` is compile-checked on GPUs below 10.x).
 
 | CUDA C | Go |
 |---|---|
@@ -279,12 +285,22 @@ All verified on hardware by `go test .` (`examples/features`, `examples/intrinsi
 | `__trap() __brkpt() __builtin_assume(c)` | `Trap() Breakpoint() Assume(c)` |
 | `__isGlobal/__isShared/__isConstant/__isLocal` | `IsGlobal/IsShared/IsConstant/IsLocal(p)` |
 | `printf(fmt, ...)` | `Printf(fmt, Args().Int(i).Float(x)...)` |
+| `%pm0..%pm3` | `PerfCounter0..3()` |
+| `wmma::load_matrix_sync / mma_sync / store_matrix_sync` (m16n16k16, half → float) | `WmmaLoadA[Col]/WmmaLoadB[Col]/WmmaLoadC[Col]`, `WmmaMma[RowCol/ColRow/ColCol]`, `WmmaStore[Col]`, `FragA/FragB/FragC` (`Fill`, `Elems`) |
+| `tex1D/tex2D/tex3D<float4>`, `tex2D<int4/uint4>`, `tex1Dfetch`, `txq` | `Tex1D Tex2D Tex3D Tex2DInt Tex2DUint Tex1DFetch TexWidth TexHeight` on a `cuda.Texture` |
+| `surf1Dread/write`, `surf2Dread/write` (32-bit) | `Surf1D/Surf2D{Read,Write}{Int32,Float32}` on a `cuda.Surface` |
+| `__ldca/__ldcg/__ldcs/__ldlu/__ldcv`, `__stwb/__stcg/__stcs/__stwt` | `LoadCA/CG/CS/LU/CV{Int32,Int64,Float32,Float64}`, `StoreWB/CG/CS/WT{…}` |
+| `this_thread_block()`, `tiled_partition<N>`, `coalesced_threads()`, `thread_rank/size/sync/shfl/ballot`, `cg::reduce` | `ThisBlock()`, `ThisWarp()`, `TiledPartition(n)`, `CoalescedThreads()` → `Block` / `Tile` methods |
+| `cluster.sync()`, `barrier.cluster.arrive/wait`, `%clusterid %cluster_ctarank %cluster_nctarank …`, `cluster.map_shared_rank(p, r)` (sm_90) | `ClusterSync/Arrive/Wait`, `ClusterIDX… ClusterCtaRank ClusterSize NumClustersX… ClusterBlockIdxX… ClusterDimX…`, `Shared[T].InCluster(rank)`, `MapShared`, `IsSharedCluster`, `ThreadFenceCluster` |
+| `mbarrier.init/arrive/arrive_drop/test_wait/inval` (sm_80), `arrive.expect_tx/expect_tx/try_wait.parity` (sm_90) | `cuda.MBarrier` in shared memory: `Init Arrive ArriveDrop Wait TestWait ArriveExpectTx ExpectTx WaitParity TryWaitParity Inval`, `PendingCount`, `FenceMBarrierInit` |
+| TMA `cp.async.bulk` global ↔ shared, `commit_group / wait_group[.read]`, `fence.proxy.async` (sm_90) | `CpAsyncBulkG2S(dst, src, bytes, bar)`, `CpAsyncBulkS2G`, `CpAsyncBulkCommit`, `CpAsyncBulkWait0/1`, `CpAsyncBulkWaitRead0/1`, `FenceProxyAsyncShared` |
+| `elect.sync` (sm_90) | `ElectSync(mask) (leader, elected)` |
+| `griddepcontrol.wait / launch_dependents` (sm_90) | `GridDepWait()`, `GridDepLaunchDependents()` |
+| `__reduce_min/max_sync(float)` (sm_100a) | `ReduceMinF32/MaxF32` (build with `-sm sm_100a -ptx 86`) |
 
-Not yet covered — see [ROADMAP.md](ROADMAP.md): tensor cores (`wmma`/`mma`), textures and
-surfaces, thread block clusters / distributed shared memory / TMA (sm_90), `__reduce_min/max_sync`
-on floats (sm_100), `elect.sync`, the cache-hint loads (`__ldcg` & co), `__grid_constant__`,
-`griddepcontrol`. Most are one `//go:linkname` to an `llvm.nvvm.*` intrinsic or one IR helper
-in `helpers.go`.
+sm_90 features need `-sm sm_90 -ptx 80` (`cudair.Options{SM: "sm_90", PTX: "80"}`); the
+driver runs that PTX on any newer GPU. Next: `wgmma`, TMA tensor maps, runtime cluster /
+PDL launch attributes — see [ROADMAP.md](ROADMAP.md).
 
 ## Examples
 
@@ -310,6 +326,14 @@ go test -v .     # the README VecAdd sample as a Go test (main_test.go)
 - `examples/memory` (`go test -run 'TestMemory|TestTraps'`) — dynamic shared memory,
   `__constant__`/`__device__` globals, `__launch_bounds__`, device `printf`, `panic`/`copy`/
   slice parameters, `__ldg`/`volatile`/`float4`, half precision, `cp.async`, grid barrier
+- `examples/advanced` (`go test -run TestAdvanced`) — tensor cores (`wmma`), textures and
+  surfaces, `//cuda:restrict`, `//cuda:grid_constant`, cache-hint loads/stores, cooperative
+  groups sugar, `%pm` counters
+- `examples/hopper` (`go test -run TestHopper`, sm_90, needs a compute capability ≥ 9.0 GPU) —
+  thread block clusters + distributed shared memory, `mbarrier`, TMA bulk copies,
+  `elect.sync`, `griddepcontrol`
+- `examples/blackwell` (`go test -run TestBlackwell`, sm_100a) — `redux.sync` on floats;
+  compiled everywhere, executed on a 10.x GPU
 
 Each `run/main.go` calls `cudair.Build` by default; `-ptx file` loads a pre-built
 PTX instead, `-v` prints the compiler commands.
@@ -333,7 +357,10 @@ llgo has no NVPTX target; its output needs these rewrites (`cudair.Build` / `goc
    global memory (`ld.global` instead of generic loads; `__ldg` → `ld.global.nc`)
 8. `cudair.*` IR helpers (`helpers.go`) supply what Go cannot spell: `atomicrmw min/max`,
    scoped/acquire-release atomics, volatile and invariant loads, `half`/`bfloat` arithmetic,
-   `<4 x float>` accesses, `cp.async`; `//cuda:launch_bounds` directives become attributes
+   `<4 x float>` accesses, `cp.async`, `wmma` fragments, `mbarrier`/TMA address spaces and
+   inline-asm PTX (`ld.global.cg`, `mbarrier.try_wait.parity`); `//cuda:launch_bounds` /
+   `cluster_dims` directives become attributes, `//cuda:restrict` adds `noalias`,
+   `//cuda:grid_constant` turns struct parameters into `byval` ones and drops llgo's local copy
 9. `__nv_*` uses pull just the needed functions out of libdevice
 10. everything is inlined and the inliner's lifetime markers stripped (an `alloca` behind a
     `&T{}` constructor must live as long as the kernel), then `-O2` with everything but the

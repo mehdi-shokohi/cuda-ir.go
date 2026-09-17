@@ -47,3 +47,17 @@ func LaneMaskGt() uint32
 
 //go:linkname LaneMaskGe llvm.nvvm.read.ptx.sreg.lanemask.ge
 func LaneMaskGe() uint32
+
+// PerfCounter0..3 are the %pm0..%pm3 performance-monitor counters.
+//
+//go:linkname PerfCounter0 llvm.nvvm.read.ptx.sreg.pm0
+func PerfCounter0() int32
+
+//go:linkname PerfCounter1 llvm.nvvm.read.ptx.sreg.pm1
+func PerfCounter1() int32
+
+//go:linkname PerfCounter2 llvm.nvvm.read.ptx.sreg.pm2
+func PerfCounter2() int32
+
+//go:linkname PerfCounter3 llvm.nvvm.read.ptx.sreg.pm3
+func PerfCounter3() int32

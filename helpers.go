@@ -82,6 +82,81 @@ func init() {
 		helpers["cp.async.ca."+n] = fmt.Sprintf("define void @NAME(ptr %%dst, ptr %%src) {\n  %%d = addrspacecast ptr %%dst to ptr addrspace(3)\n  %%s = addrspacecast ptr %%src to ptr addrspace(1)\n  call void @llvm.nvvm.cp.async.ca.shared.global.%[1]s(ptr addrspace(3) %%d, ptr addrspace(1) %%s)\n  ret void\n}", n)
 	}
 	helpers["cp.async.cg.16"] = "define void @NAME(ptr %dst, ptr %src) {\n  %d = addrspacecast ptr %dst to ptr addrspace(3)\n  %s = addrspacecast ptr %src to ptr addrspace(1)\n  call void @llvm.nvvm.cp.async.cg.shared.global.16(ptr addrspace(3) %d, ptr addrspace(1) %s)\n  ret void\n}"
+
+	// cache-hint loads and stores (__ldcg & co): no LLVM spelling, so
+	// inline asm on the pointer cast to global memory
+	for ty, tc := range map[string][2]string{"i32": {"b32", "r"}, "i64": {"b64", "l"}, "float": {"f32", "f"}, "double": {"f64", "d"}} {
+		ptxTy, con := tc[0], tc[1] // PTX type suffix, inline-asm register constraint
+		for _, hint := range []string{"ca", "cg", "cs", "lu", "cv"} {
+			helpers[fmt.Sprintf("ld.%s.%s", hint, ty)] = fmt.Sprintf(
+				"define %[1]s @NAME(ptr %%p) {\n  %%g = addrspacecast ptr %%p to ptr addrspace(1)\n  %%r = call %[1]s asm sideeffect \"ld.global.%[2]s.%[3]s $0, [$1];\", \"=%[4]s,l\"(ptr addrspace(1) %%g)\n  ret %[1]s %%r\n}", ty, hint, ptxTy, con)
+		}
+		for _, hint := range []string{"wb", "cg", "cs", "wt"} {
+			helpers[fmt.Sprintf("st.%s.%s", hint, ty)] = fmt.Sprintf(
+				"define void @NAME(ptr %%p, %[1]s %%v) {\n  %%g = addrspacecast ptr %%p to ptr addrspace(1)\n  call void asm sideeffect \"st.global.%[2]s.%[3]s [$0], $1;\", \"l,%[4]s\"(ptr addrspace(1) %%g, %[1]s %%v)\n  ret void\n}", ty, hint, ptxTy, con)
+		}
+	}
+	// tensor cores: wmma m16n16k16, half in, float accumulate. A fragment is
+	// an aggregate of 8 <2 x half> (A/B) or 8 floats (C/D) that the Go side
+	// holds as [8]uint32 / [8]float32 behind a pointer.
+	const fragAB = "{ <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half> }"
+	const fragC = "{ float, float, float, float, float, float, float, float }"
+	for _, layout := range []string{"row", "col"} {
+		for _, m := range []string{"a", "b"} {
+			helpers[fmt.Sprintf("wmma.load.%s.%s", m, layout)] = fmt.Sprintf(
+				"declare %[1]s @llvm.nvvm.wmma.m16n16k16.load.%[2]s.%[3]s.stride.f16.p0(ptr, i32)\ndefine void @NAME(ptr %%f, ptr %%p, i32 %%ldm) {\n  %%v = call %[1]s @llvm.nvvm.wmma.m16n16k16.load.%[2]s.%[3]s.stride.f16.p0(ptr %%p, i32 %%ldm)\n  store %[1]s %%v, ptr %%f, align 4\n  ret void\n}", fragAB, m, layout)
+		}
+		helpers["wmma.load.c."+layout] = fmt.Sprintf(
+			"declare %[1]s @llvm.nvvm.wmma.m16n16k16.load.c.%[2]s.stride.f32.p0(ptr, i32)\ndefine void @NAME(ptr %%f, ptr %%p, i32 %%ldm) {\n  %%v = call %[1]s @llvm.nvvm.wmma.m16n16k16.load.c.%[2]s.stride.f32.p0(ptr %%p, i32 %%ldm)\n  store %[1]s %%v, ptr %%f, align 4\n  ret void\n}", fragC, layout)
+		helpers["wmma.store.d."+layout] = fmt.Sprintf(
+			"declare void @llvm.nvvm.wmma.m16n16k16.store.d.%[2]s.stride.f32.p0(ptr, float, float, float, float, float, float, float, float, i32)\ndefine void @NAME(ptr %%p, ptr %%f, i32 %%ldm) {\n  %%v = load %[1]s, ptr %%f, align 4\n%[3]s  call void @llvm.nvvm.wmma.m16n16k16.store.d.%[2]s.stride.f32.p0(ptr %%p, %[4]s, i32 %%ldm)\n  ret void\n}", fragC, layout, extractAll("v", "d", fragC, 8), args("float", "d", 8))
+		for _, lb := range []string{"row", "col"} {
+			helpers[fmt.Sprintf("wmma.mma.%s.%s", layout, lb)] = fmt.Sprintf(
+				"declare %[1]s @llvm.nvvm.wmma.m16n16k16.mma.%[3]s.%[4]s.f32.f32(%[5]s)\ndefine void @NAME(ptr %%d, ptr %%a, ptr %%b, ptr %%c) {\n  %%va = load %[2]s, ptr %%a, align 4\n  %%vb = load %[2]s, ptr %%b, align 4\n  %%vc = load %[1]s, ptr %%c, align 4\n%[6]s%[7]s%[8]s  %%r = call %[1]s @llvm.nvvm.wmma.m16n16k16.mma.%[3]s.%[4]s.f32.f32(%[9]s)\n  store %[1]s %%r, ptr %%d, align 4\n  ret void\n}",
+				fragC, fragAB, layout, lb,
+				strings.Repeat("<2 x half>, ", 16)+strings.TrimSuffix(strings.Repeat("float, ", 8), ", "),
+				extractAll("va", "a", fragAB, 8), extractAll("vb", "b", fragAB, 8), extractAll("vc", "c", fragC, 8),
+				args("<2 x half>", "a", 8)+", "+args("<2 x half>", "b", 8)+", "+args("float", "c", 8))
+		}
+	}
+	// mbarrier (sm_80+) and bulk async copies (sm_90+): the intrinsics want
+	// shared / global typed pointers; arrive.expect_tx and try_wait.parity
+	// have no LLVM 22 intrinsic and use inline asm on the 32-bit shared
+	// address.
+	const toShared = "  %s = addrspacecast ptr %p to ptr addrspace(3)\n"
+	const toShared32 = toShared + "  %a = ptrtoint ptr addrspace(3) %s to i32\n"
+	helpers["mbarrier.init"] = "define void @NAME(ptr %p, i32 %n) {\n" + toShared + "  call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3) %s, i32 %n)\n  ret void\n}"
+	helpers["mbarrier.inval"] = "define void @NAME(ptr %p) {\n" + toShared + "  call void @llvm.nvvm.mbarrier.inval.shared(ptr addrspace(3) %s)\n  ret void\n}"
+	helpers["mbarrier.arrive"] = "define i64 @NAME(ptr %p) {\n" + toShared + "  %r = call i64 @llvm.nvvm.mbarrier.arrive.shared(ptr addrspace(3) %s)\n  ret i64 %r\n}"
+	helpers["mbarrier.arrive.drop"] = "define i64 @NAME(ptr %p) {\n" + toShared + "  %r = call i64 @llvm.nvvm.mbarrier.arrive.drop.shared(ptr addrspace(3) %s)\n  ret i64 %r\n}"
+	helpers["mbarrier.test.wait"] = "define i1 @NAME(ptr %p, i64 %t) {\n" + toShared + "  %r = call i1 @llvm.nvvm.mbarrier.test.wait.shared(ptr addrspace(3) %s, i64 %t)\n  ret i1 %r\n}"
+	helpers["mbarrier.arrive.expect_tx"] = "define i64 @NAME(ptr %p, i32 %n) {\n" + toShared32 + "  %r = call i64 asm sideeffect \"mbarrier.arrive.expect_tx.shared::cta.b64 $0, [$1], $2;\", \"=l,r,r\"(i32 %a, i32 %n)\n  ret i64 %r\n}"
+	helpers["mbarrier.expect_tx"] = "define void @NAME(ptr %p, i32 %n) {\n" + toShared32 + "  call void asm sideeffect \"mbarrier.expect_tx.shared::cta.b64 [$0], $1;\", \"r,r\"(i32 %a, i32 %n)\n  ret void\n}"
+	helpers["mbarrier.try_wait.parity"] = "define i1 @NAME(ptr %p, i32 %parity) {\n" + toShared32 + "  %r = call i32 asm sideeffect \"{\\0A\\09.reg .pred p;\\0A\\09mbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\\0A\\09selp.u32 $0, 1, 0, p;\\0A\\09}\", \"=r,r,r\"(i32 %a, i32 %parity)\n  %b = icmp ne i32 %r, 0\n  ret i1 %b\n}"
+	helpers["fence.mbarrier_init"] = "define void @NAME() {\n  call void asm sideeffect \"fence.mbarrier_init.release.cluster;\", \"\"()\n  ret void\n}"
+	helpers["fence.proxy.async.shared"] = "define void @NAME() {\n  call void asm sideeffect \"fence.proxy.async.shared::cta;\", \"\"()\n  ret void\n}"
+	helpers["fence.acq_rel.cluster"] = "define void @NAME() {\n  call void asm sideeffect \"fence.acq_rel.cluster;\", \"\"()\n  ret void\n}"
+	helpers["cp.async.bulk.g2s"] = "define void @NAME(ptr %dst, ptr %src, i32 %n, ptr %bar) {\n  %d = addrspacecast ptr %dst to ptr addrspace(7)\n  %s = addrspacecast ptr %src to ptr addrspace(1)\n  %b = addrspacecast ptr %bar to ptr addrspace(3)\n  call void @llvm.nvvm.cp.async.bulk.global.to.shared.cluster(ptr addrspace(7) %d, ptr addrspace(3) %b, ptr addrspace(1) %s, i32 %n, i16 0, i64 0, i1 false, i1 false)\n  ret void\n}"
+	helpers["cp.async.bulk.s2g"] = "define void @NAME(ptr %dst, ptr %src, i32 %n) {\n  %d = addrspacecast ptr %dst to ptr addrspace(1)\n  %s = addrspacecast ptr %src to ptr addrspace(3)\n  call void @llvm.nvvm.cp.async.bulk.shared.cta.to.global(ptr addrspace(1) %d, ptr addrspace(3) %s, i32 %n, i64 0, i1 false)\n  ret void\n}"
+}
+
+// extractAll returns IR lines that extract the n fields of the aggregate
+// %v (of type ty) into %<prefix>0..n-1.
+func extractAll(v, prefix, ty string, n int) string {
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "  %%%s%d = extractvalue %s %%%s, %d\n", prefix, i, ty, v, i)
+	}
+	return b.String()
+}
+
+// args returns "ty %prefix0, ty %prefix1, ...".
+func args(ty, prefix string, n int) string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("%s %%%s%d", ty, prefix, i)
+	}
+	return strings.Join(out, ", ")
 }
 
 func size(ty string) int {

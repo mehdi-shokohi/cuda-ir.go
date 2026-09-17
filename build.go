@@ -25,8 +25,11 @@
 //  5. cuda.Shared / DynShared / Constant globals move to their address
 //     space; exported package-level variables keep their Go name.
 //  6. `cudair.*` IR helpers, math/bits and math.Float32bits & co get bodies.
-//  7. `//cuda:launch_bounds N [M]` / `//cuda:maxnreg N` doc-comment
-//     directives become NVPTX function attributes.
+//  7. `//cuda:launch_bounds N [M]` / `//cuda:maxnreg N` / `//cuda:cluster_dims`
+//     doc-comment directives become NVPTX function attributes;
+//     `//cuda:restrict` marks the kernel's pointer parameters `noalias`,
+//     `//cuda:grid_constant` passes its struct parameters `byval` in
+//     parameter space (no local copy when their address is taken).
 package cudair
 
 import (
@@ -60,6 +63,16 @@ var (
 	reAlloc = regexp.MustCompile(`^(\s*)(%[^ ]+) = call ptr @"` + regexp.QuoteMeta(runtimePrefix) + `internal/runtime\.(AllocU|AllocZ)"\(i64 ([^)]+)\)`)
 	// a cuda.Buf[T] parameter of a kernel: `%"...cuda.Buf[float32]" %3`
 	reBufParam = regexp.MustCompile(`(%"github.com/mehdi-shokohi/cuda-ir.go/cuda\.Buf\[[^"]*\]") %([0-9A-Za-z_.]+)`)
+	// a struct-typed kernel parameter: `%"pkg.Params" %2` (a Go slice is
+	// `%"...runtime.Slice"` and stays a by-value aggregate)
+	reStructParam = regexp.MustCompile(`(%"[^"]*") %([0-9A-Za-z_.]+)`)
+	// the local copy llgo makes of an address-taken parameter, after the
+	// AllocU/AllocZ rewrite: `%3 = alloca i8, i64 12, align 16` (followed
+	// by its memset on a second line for AllocZ)
+	reAllocaLine = regexp.MustCompile(`^\s*(%[^ ]+) = alloca i8, i64 [^,]+, align \d+(\n\s*call void @llvm\.memset[^\n]*)?$`)
+	reDeclName   = regexp.MustCompile(`^declare .*@("[^"]+"|[^(]+)\(`)
+	// a global's alignment below 16
+	reAlignSmall = regexp.MustCompile(`, align (1|2|4|8)$`)
 )
 
 const libdevicePrefix = "__nv_"
@@ -617,7 +630,11 @@ func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]dir
 	// functions are actually called (declarations alone are harmless: type
 	// descriptors reference equality helpers that never run).
 	called := map[string]bool{}
+	srcDeclared := map[string]bool{} // every `declare` in llgo's IR
 	scanLines(src, func(line string) error {
+		if d := reDeclName.FindStringSubmatch(line); d != nil {
+			srcDeclared[strings.Trim(d[1], `"`)] = true
+		}
 		if g := reAnyGlobal.FindStringSubmatch(line); g != nil {
 			name := strings.Trim(g[1], `"`)
 			if pkg, s := splitName(name); pkg == rootPkg && isExported(s) {
@@ -635,23 +652,51 @@ func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]dir
 		}
 		return nil
 	})
-	var bufParams [][2]string // {type, name} of the Buf[T] params of the kernel being emitted
-	inKernel := false
+	// the kernel being emitted: lines to insert after the entry label, value
+	// renames to apply to its body, and the byval struct params whose local
+	// copy (`alloca` + `store`) is elided
+	var entry []string
+	var renames []*regexp.Regexp
+	var renameTo []string
+	var gridParams map[string]string // param name -> type of `//cuda:grid_constant` params
+	kernelStart, inKernel, inEntry := 0, false, false
+	rename := func(from, to string) {
+		renames = append(renames, regexp.MustCompile(`%`+regexp.QuoteMeta(from)+`\b`))
+		renameTo = append(renameTo, "%"+to)
+	}
 	err = scanLines(src, func(line string) error {
 		if inKernel {
 			switch {
 			case line == "}":
 				inKernel = false
-			case strings.HasSuffix(line, ":") && len(bufParams) > 0:
-				// entry block: rebuild the Buf[T] values from the ptr params
+			case inEntry && strings.HasSuffix(line, ":"):
+				// the entry label: rebuild the Buf[T] values from the ptr
+				// params, load the byval structs
 				out = append(out, line)
-				for _, bp := range bufParams {
-					out = append(out, fmt.Sprintf("  %%g%[1]s = insertvalue %[2]s undef, ptr %%%[1]s, 0", bp[1], bp[0]))
-				}
+				out = append(out, entry...)
+				entry, inEntry = nil, false
 				return nil
 			default:
-				for _, bp := range bufParams {
-					line = regexp.MustCompile(`%`+regexp.QuoteMeta(bp[1])+`\b`).ReplaceAllString(line, "%g"+bp[1])
+				for i, re := range renames {
+					line = re.ReplaceAllString(line, renameTo[i])
+				}
+				// `store %T %gN, ptr %M, align A` into llgo's local copy of
+				// a grid_constant param: the copy (alloca + memset) is
+				// dropped and uses of %M read the parameter in place
+				if f := strings.Fields(line); len(f) >= 5 && f[0] == "store" && f[3] == "ptr" {
+					param := strings.TrimPrefix(strings.TrimSuffix(f[2], ","), "%g")
+					dst := strings.TrimSuffix(f[4], ",")
+					if ty, ok := gridParams[param]; ok && f[1] == ty {
+						for i := len(out) - 1; i >= kernelStart; i-- {
+							m := reAllocaLine.FindStringSubmatch(out[i])
+							if m == nil || m[1] != dst {
+								continue
+							}
+							out = append(out[:i], out[i+1:]...)
+							rename(dst[1:], param)
+							return nil
+						}
+					}
 				}
 			}
 		}
@@ -681,6 +726,21 @@ func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]dir
 			define := func(body string) {
 				body = strings.Replace(body, "NAME", m.mangle(name), 1)
 				body = strings.ReplaceAll(body, "%SLICE", `%"`+runtimePrefix+`internal/runtime.Slice"`)
+				// a helper may carry `declare`s of intrinsics whose
+				// signature intrinsicDecls cannot derive (aggregate
+				// returns); keep each once, and not if llgo declared it
+				var keep []string
+				for _, l := range strings.Split(body, "\n") {
+					if d := reDeclName.FindStringSubmatch(l); d != nil {
+						n := strings.Trim(d[1], `"`)
+						if declared[n] || srcDeclared[n] {
+							continue
+						}
+						declared[n] = true
+					}
+					keep = append(keep, l)
+				}
+				body = strings.Join(keep, "\n")
 				bodies = append(bodies, body)
 				line = body
 			}
@@ -738,14 +798,36 @@ func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]dir
 				// into global memory and emits ld.global / st.global instead
 				// of generic loads and stores. The body sees the struct again
 				// from the entry block on.
-				inKernel, bufParams = true, nil
+				inKernel, inEntry, kernelStart = true, true, len(out)+1
+				entry, renames, renameTo, gridParams = nil, nil, nil, map[string]string{}
 				for _, m := range reBufParam.FindAllStringSubmatch(line, -1) {
-					bufParams = append(bufParams, [2]string{m[1], m[2]})
+					entry = append(entry, fmt.Sprintf("  %%g%[1]s = insertvalue %[2]s undef, ptr %%%[1]s, 0", m[2], m[1]))
+					rename(m[2], "g"+m[2])
 				}
 				line = reBufParam.ReplaceAllString(line, "ptr %$2")
 				line = strings.Replace(line, "define "+d[1], "define "+d[1]+"ptx_kernel ", 1)
-				if dir, ok := dirs[s]; ok {
-					line = strings.Replace(line, ") #", ") "+dir.attrs()+" #", 1)
+				dir := dirs[s]
+				if dir.restrict {
+					// __restrict__: no two pointer parameters alias
+					line = strings.ReplaceAll(line, "ptr %", "ptr noalias %")
+				}
+				if dir.gridConstant {
+					// __grid_constant__: struct parameters stay in parameter
+					// space (byval); the body reads them there and may take
+					// their address without a local copy
+					line = reStructParam.ReplaceAllStringFunc(line, func(p string) string {
+						m := reStructParam.FindStringSubmatch(p)
+						if strings.HasSuffix(m[1], `internal/runtime.Slice"`) {
+							return p
+						}
+						gridParams[m[2]] = m[1]
+						entry = append(entry, fmt.Sprintf("  %%g%[1]s = load %[2]s, ptr %%%[1]s, align 16", m[2], m[1]))
+						rename(m[2], "g"+m[2])
+						return fmt.Sprintf(`ptr byval(%s) align 16 "nvvm.grid_constant" %%%s`, m[1], m[2])
+					})
+				}
+				if a := dir.attrs(); a != "" {
+					line = strings.Replace(line, ") #", ") "+a+" #", 1)
 				}
 				found = append(found, s)
 			}
@@ -764,6 +846,9 @@ func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]dir
 			default:
 				line = strings.Replace(line, "global %", "addrspace(3) global %", 1)
 				line = strings.Replace(line, "zeroinitializer", "undef", 1)
+				// 16-byte aligned like the dynamic block: vector accesses,
+				// cp.async and TMA copies need it
+				line = reAlignSmall.ReplaceAllString(line, ", align 16")
 			}
 		} else if len(cudaGlobals) > 0 {
 			cast := func(name string) string {

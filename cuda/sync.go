@@ -335,3 +335,26 @@ func ReduceMaxU(mask uint32, v uint32) uint32 { return reduxUMax(v, mask) }
 func ReduceAnd(mask uint32, v uint32) uint32  { return reduxAnd(v, mask) }
 func ReduceOr(mask uint32, v uint32) uint32   { return reduxOr(v, mask) }
 func ReduceXor(mask uint32, v uint32) uint32  { return reduxXor(v, mask) }
+
+// ---- elect.sync (sm_90+), float reductions (sm_100a+)
+
+//go:linkname electSync llvm.nvvm.elect.sync
+func electSync(mask uint32) (uint32, bool)
+
+// ElectSync is elect.sync (sm_90+): picks one leader among the lanes in
+// mask; `elected` is true in that lane only, `leader` is its lane id.
+func ElectSync(mask uint32) (leader int32, elected bool) {
+	l, e := electSync(mask)
+	return int32(l), e
+}
+
+//go:linkname reduxFMin llvm.nvvm.redux.sync.fmin
+func reduxFMin(v float32, mask uint32) float32
+
+//go:linkname reduxFMax llvm.nvvm.redux.sync.fmax
+func reduxFMax(v float32, mask uint32) float32
+
+// ReduceMinF32 / ReduceMaxF32 are __reduce_min_sync / __reduce_max_sync on
+// floats (redux.sync.min.f32, sm_100a+; build with -sm sm_100a).
+func ReduceMinF32(mask uint32, v float32) float32 { return reduxFMin(v, mask) }
+func ReduceMaxF32(mask uint32, v float32) float32 { return reduxFMax(v, mask) }

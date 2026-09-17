@@ -169,22 +169,14 @@ func TestFeatures(t *testing.T) {
 // Skips the test when no CUDA driver / device is present.
 func loadKernels(t *testing.T, pkg string) (*cuda.Context, *cuda.Module, *cudair.Result) {
 	t.Helper()
-	if os.Getenv("LLGO_ROOT") == "" {
-		os.Setenv("LLGO_ROOT", findLLGoRoot())
-	}
-	res, err := cudair.Build(pkg, nil) // Go -> PTX, in-process
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	t.Log("kernels:", res.Kernels)
+	return loadKernelsOpts(t, pkg, nil)
+}
 
-	if err := cuda.Init(); err != nil {
-		t.Skipf("no CUDA driver: %v", err)
-	}
-	dev, err := cuda.GetDevice(0)
-	if err != nil {
-		t.Skipf("no CUDA device: %v", err)
-	}
+// loadKernelsOpts is loadKernels with build options (e.g. SM: "sm_90").
+func loadKernelsOpts(t *testing.T, pkg string, opts *cudair.Options) (*cuda.Context, *cuda.Module, *cudair.Result) {
+	t.Helper()
+	res := buildKernels(t, pkg, opts)
+	dev := device(t)
 	ctx, err := dev.Primary()
 	if err != nil {
 		t.Fatal(err)
@@ -196,6 +188,43 @@ func loadKernels(t *testing.T, pkg string) (*cuda.Context, *cuda.Module, *cudair
 	}
 	t.Cleanup(func() { mod.Close() })
 	return ctx, mod, res
+}
+
+// buildKernels compiles pkg to PTX in-process.
+func buildKernels(t *testing.T, pkg string, opts *cudair.Options) *cudair.Result {
+	t.Helper()
+	if os.Getenv("LLGO_ROOT") == "" {
+		os.Setenv("LLGO_ROOT", findLLGoRoot())
+	}
+	res, err := cudair.Build(pkg, opts) // Go -> PTX, in-process
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	t.Log("kernels:", res.Kernels)
+	return res
+}
+
+// device returns GPU 0, skipping the test without a driver or device.
+func device(t *testing.T) *cuda.Device {
+	t.Helper()
+	if err := cuda.Init(); err != nil {
+		t.Skipf("no CUDA driver: %v", err)
+	}
+	dev, err := cuda.GetDevice(0)
+	if err != nil {
+		t.Skipf("no CUDA device: %v", err)
+	}
+	return dev
+}
+
+// computeCapability of GPU 0 (skips without a device).
+func computeCapability(t *testing.T) (major, minor int) {
+	t.Helper()
+	major, minor, err := device(t).ComputeCapability()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return major, minor
 }
 
 // download copies a device buffer into a new slice.

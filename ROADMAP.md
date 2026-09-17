@@ -4,7 +4,8 @@ What `package cuda` covers is the table in [README → Device API](README.md#dev
 This file tracks the CUDA C device-side keywords / intrinsics by release. Every "done"
 entry is proven on hardware by a Go test (`go test -v .`): the subtest named in the last
 column checks the result against a CPU model and, where it matters, the PTX for the expected
-instruction. Names were checked against LLVM 22's `IntrinsicsNVVM.td` and CUDA 13.1's
+instruction (the few exceptions — features the test GPU cannot run — say so in that
+column). Names were checked against LLVM 22's `IntrinsicsNVVM.td` and CUDA 13.1's
 `libdevice.10.bc`.
 
 **how**: `intrinsic` = one `//go:linkname` to `llvm.*`/`llvm.nvvm.*`; `libdevice` = one
@@ -65,20 +66,43 @@ Also fixed on the way: `declare`s with return attributes (`nonnull ptr …`) or 
 were silently skipped by the old regex; the "unsupported runtime function" check now looks at
 call sites, not declarations (type descriptors reference `strequal` without calling it).
 
-## v0.4 — next
+## v0.4 — done: tensor cores, textures, sm_90
+
+Proven by `TestAdvanced` (`examples/advanced`, any sm_80 GPU), `TestHopper`
+(`examples/hopper`, built with `-sm sm_90 -ptx 80`; runs on compute capability ≥ 9.0 —
+tested on sm_120) and `TestBlackwell` (`examples/blackwell`, `-sm sm_100a -ptx 86`).
+
+| CUDA C | Go | how | proven by |
+|---|---|---|---|
+| `wmma::load_matrix_sync / mma_sync / store_matrix_sync` m16n16k16 half → float, row/col layouts, `fill_fragment` | `FragA/FragB/FragC`, `WmmaLoadA[Col]/WmmaLoadB[Col]/WmmaLoadC[Col]`, `WmmaMma[RowCol/ColRow/ColCol]`, `WmmaStore[Col]`, `FragC.Fill/Elems` | helper (fragments are `{8 x <2 x half>}` / `{8 x float}` aggregates behind a pointer; the helper carries the intrinsic `declare`) | `TestAdvanced/Wmma` (64×64 matmul + bias vs CPU, both B layouts, both store layouts) |
+| `tex2D<float4>(texObj, x, y)`, `tex1D`, `tex3D`, `tex2D<int4/uint4>`, `tex1Dfetch`, `txq.width/height` | `cuda.Texture` (u64 param, host: gocudrv `NewTexture` + `ArgTexture`), `Tex2D Tex1D Tex3D Tex2DInt Tex2DUint Tex1DFetch TexWidth TexHeight` | intrinsic (`llvm.nvvm.tex.unified.*`; a 4-value Go return is the `{float x4}` the intrinsic returns) | `TestAdvanced/Texture` (point + linear filtering, clamp, txq); `Tex1D/Tex3D/Tex1DFetch/Tex2DInt` compile-checked only — gocudrv has 2D arrays |
+| `surf2Dread/surf2Dwrite`, `surf1Dread/write` (32-bit elements) | `cuda.Surface` (host: `NewSurface` + `ArgSurface`), `Surf2DRead/WriteInt32/Float32`, `Surf1D…` | intrinsic (`llvm.nvvm.suld/sust.b.*.i32.trap`; x in bytes, floats through the bits) | `TestAdvanced/Surface` (float and int surfaces) |
+| `__cluster_dims__(x,y,z)`, `cluster.sync()`, `barrier.cluster.arrive/wait`, `%clusterid %nclusterid %cluster_ctarank %cluster_nctarank %cluster_ctaid %cluster_nctaid`, `cluster.map_shared_rank` (distributed shared memory), `__isClusterShared`, `fence.acq_rel/sc.cluster` (sm_90) | `//cuda:cluster_dims 2 [1 [1]]` → `.reqnctapercluster` so a plain launch works; `ClusterSync/Arrive/Wait`, `ClusterIDX… NumClustersX… ClusterCtaRank ClusterSize ClusterBlockIdxX… ClusterDimX…`, `Shared[T].InCluster(rank)`, `MapShared`, `IsSharedCluster`, `ThreadFenceCluster FenceSCCluster` | directive → `"nvvm.cluster_dim"` attribute; intrinsics (`llvm.nvvm.mapa` on the generic pointer); asm helper for the acq_rel fence | `TestHopper/Cluster` (8 blocks in clusters of 2 read each other's tile; rank/size/id checked) |
+| `mbarrier.init/arrive/arrive_drop/test_wait/pending_count/inval` (sm_80), `arrive.expect_tx / expect_tx / try_wait.parity` (sm_90), `fence.mbarrier_init` | `cuda.MBarrier` in `Shared[…]`: `Init Arrive ArriveDrop Wait/TestWait ArriveExpectTx ExpectTx WaitParity/TryWaitParity Inval`, `PendingCount`, `FenceMBarrierInit` | helpers (`addrspacecast` to `addrspace(3)` for `llvm.nvvm.mbarrier.*.shared`; inline asm for the sm_90 forms) | `TestHopper/MBarrier`, `TestHopper/TMA` |
+| TMA: `cp.async.bulk.shared::cluster.global` (mbarrier completion), `cp.async.bulk.global.shared::cta`, `commit_group / wait_group[.read]`, `fence.proxy.async.shared::cta` (sm_90) | `CpAsyncBulkG2S(dst, src, bytes, bar)`, `CpAsyncBulkS2G`, `CpAsyncBulkCommit`, `CpAsyncBulkWait0/1`, `CpAsyncBulkWaitRead0/1`, `FenceProxyAsyncShared` | helpers (`llvm.nvvm.cp.async.bulk.*` with `addrspace(7)/(3)/(1)` casts); `cuda.Shared` globals are now 16-byte aligned | `TestHopper/TMA` (1 KiB tiles global → shared → global, doubled in between) |
+| `elect.sync` (sm_90) | `ElectSync(mask) (leader, elected)` | intrinsic (`{i32, i1}` return) | `TestHopper/Elect` (one lane per warp, `leader` is its lane id) |
+| `griddepcontrol.wait / launch_dependents` (programmatic dependent launch, sm_90) | `GridDepWait GridDepLaunchDependents` | intrinsic | `TestHopper/GridDep` (executes as no-ops without the launch attribute, which gocudrv does not expose) |
+| `__reduce_min/max_sync(float)` (`redux.sync.min/max.f32`, sm_100a) | `ReduceMinF32/MaxF32` | intrinsic; LLVM 22 selects it for `sm_100a` only | `TestBlackwell`: compiled and checked in the PTX; executed only on a 10.x GPU (not the sm_120 test machine) |
+| `__ldca/__ldcg/__ldcs/__ldlu/__ldcv`, `__stwb/__stcg/__stcs/__stwt` (int32/int64/float32/float64) | `LoadCA/CG/CS/LU/CV{Int32,Int64,Float32,Float64}`, `StoreWB/CG/CS/WT{…}` | helper (inline asm `ld.global.<hint>` / `st.global.<hint>` on the pointer cast to global) | `TestAdvanced/CacheHints` (every variant in the PTX, values checked) |
+| `__restrict__` | `//cuda:restrict` doc comment | `noalias` on the kernel's pointer params → llc emits `ld.global.nc` for read-only ones | `TestAdvanced/Restrict` (`Restrict` has `ld.global.nc`, the same kernel without the directive does not) |
+| `__grid_constant__` | `//cuda:grid_constant` doc comment (struct params must not be written) | struct params become `ptr byval(T) "nvvm.grid_constant"`; llgo's local copy for `&p` is elided → `cvta.param`, no `.local` | `TestAdvanced/GridConstant` (`&p` passed to a `//go:noinline` function; no `.local` depot, the undirected twin has one) |
+| Cooperative groups: `this_thread_block()`, `tiled_partition<N>`, `coalesced_threads()`, `thread_rank/size/meta_group_rank/sync/shfl*/all/any/ballot`, `cg::reduce` | `ThisBlock()`, `ThisWarp()`, `TiledPartition(n)`, `CoalescedThreads()` → `Block` / `Tile` methods | plain Go over `Shfl*/Ballot/SyncWarp/ActiveMask/redux` | `TestAdvanced/Groups` |
+| `%pm0..%pm3` | `PerfCounter0..3` | intrinsic | `TestAdvanced/PerfCounters` |
+
+Also on the way: `parser.ParseDir` (deprecated in Go 1.25) replaced by per-file parsing in
+`directives.go`; IR helpers may carry their own `declare` lines (needed for aggregate-returning
+intrinsics, deduplicated against llgo's declarations).
+
+## v0.5 — next
 
 | CUDA C | proposed Go | notes |
 |---|---|---|
-| Tensor cores: `wmma::load_matrix_sync / mma_sync / store_matrix_sync`, `mma.sync` (sm_70+), `wgmma` (sm_90) | opaque `FragA/FragB/FragC` + `WmmaLoadA/…/WmmaMma/WmmaStore` | `llvm.nvvm.wmma.m16n16k16.*`; fragments are `<8 x half>`/`<8 x float>` aggregates → helpers; `cuda.Half` exists now |
-| Textures / surfaces: `tex1D/tex2D/tex3D<T>(texObj,…)`, `surf2Dread/write` | `cuda.Texture2D` (u64 handle param), `Tex2DF32(t, x, y) (r,g,b,a)` | `llvm.nvvm.tex.unified.2d.v4f32.f32` (22 families in LLVM 22), `llvm.nvvm.suld/sust.*`; gocudrv creates the objects |
-| Thread block clusters (sm_90): `__cluster_dims__`, `cluster.sync()`, `%clusterid`, `%cluster_ctarank`, distributed shared memory (`mapa`) | `ClusterSync() ClusterID() ClusterCtaRank()`, `Shared[T].InCluster(rank)` | `llvm.nvvm.barrier.cluster.arrive/wait`, `…sreg.clusterid.*`, `llvm.nvvm.mapa`; `//cuda:cluster_dims` → `"nvvm.cluster_dim"`; host launch attributes |
-| TMA `cp.async.bulk`, `mbarrier` (sm_90) | after `cp.async` | `llvm.nvvm.cp.async.bulk.*`, `llvm.nvvm.mbarrier.*` |
-| `__reduce_min/max_sync(float)` (sm_100), `elect.sync` (sm_90) | `ReduceMinF32/MaxF32`, `ElectSync` | `llvm.nvvm.redux.sync.fmin/fmax`, `llvm.nvvm.elect.sync`; need `-sm sm_90/sm_100` |
-| cache-hint loads/stores `__ldca/__ldcg/__ldcs/__ldlu/__ldcv`, `__stwb/__stcg/__stcs/__stwt` | `LoadCG/… StoreCS/…` | `!nontemporal` for `.cs`; the others need inline-asm-style helpers |
-| `__restrict__` on `Buf` parameters | `//cuda:restrict` | `noalias` on the (now plain `ptr`) kernel params |
-| `__grid_constant__`, `griddepcontrol` / programmatic dependent launch (sm_90) | attribute; `GridDepLaunchDependents() GridDepWait()` | `!nvvm.annotations`; `llvm.nvvm.griddepcontrol.*` |
-| Cooperative groups sugar: `thread_block`, `tiled_partition<32>`, `coalesced_threads()` | `cuda.Warp` / `cuda.Tile[N]` helpers | over `Shfl/Ballot/SyncWarp/ActiveMask`; no new IR |
-| `%pm0..%pm3` | `PerfCounter0..3` | intrinsic `…sreg.pm0..3` |
+| `wgmma` (sm_90a), `mma.sync` raw shapes (`m16n8k16` …), `ldmatrix/stmatrix`, `bf16/tf32/int8` wmma, `__nv_fp8` | `MmaSync…`, `WmmaBF16…` | `llvm.nvvm.wgmma.*` needs `-sm sm_90a` (not runnable on sm_120 hardware; compile-check like `TestBlackwell`); `llvm.nvvm.mma.m16n8k16.*`, `llvm.nvvm.ldmatrix.*` |
+| TMA tensor maps: `cp.async.bulk.tensor` (2D–5D tiles), multicast to the cluster | `CpAsyncBulkTensor2D(map, …)` | needs `cuTensorMapEncodeTiled` on the host (not in gocudrv yet); `llvm.nvvm.cp.async.bulk.tensor.*` |
+| Runtime cluster dims and programmatic dependent launch attributes | host side | `cuLaunchKernelEx` launch attributes — gocudrv v0.3 has no `LaunchKernelEx`; the compile-time `//cuda:cluster_dims` route works today |
+| `tex1D/tex3D`, layered / cubemap textures, 4-channel arrays | existing API | proven on hardware once gocudrv grows 1D/3D/multi-channel arrays |
+| `__nanosleep`-based `cuda::barrier` phases, `cuda::pipeline` sugar over `cp.async` / TMA | `Pipeline` helper | pure Go over the existing primitives |
+| `redux.sync.f32` on hardware | — | needs a 10.x GPU |
 
 ## Not planned (needs a device runtime or is host-side)
 
@@ -87,5 +111,6 @@ call sites, not declarations (type descriptors reference `strequal` without call
   stack-based (`alloca`) and dies with the kernel; use pre-allocated buffers for anything else.
 - Go `make/append/map/string operations/interface/goroutine/defer/closure` on the device —
   stay compile errors.
-- Streams, events, graphs, unified memory, `cudaMemcpyAsync`, `cudaOccupancy*` — host API,
-  covered by [gocudrv](https://github.com/eitamring/gocudrv).
+- Streams, events, graphs, unified memory, `cudaMemcpyAsync`, `cudaOccupancy*`, texture /
+  surface objects, launch attributes — host API, covered by
+  [gocudrv](https://github.com/eitamring/gocudrv).
