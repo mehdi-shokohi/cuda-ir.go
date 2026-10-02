@@ -164,3 +164,52 @@ func MatMul16(a, b cuda.Buf[cuda.Half], c cuda.Buf[float32], n int32) {
 	}
 	cuda.WmmaStore(c.Ptr(row*16*n+col*16), n, acc) // wmma::store_matrix_sync
 }
+
+// ---- stmatrix (sm_90+)
+
+var stTile cuda.Shared[[4 * 64]cuda.Half] // four 8x8 matrices, row-major
+
+// StMatrixRoundTrip reads four 8x8 half matrices out of in with ldmatrix and
+// writes them back to shared memory with stmatrix, which must be its exact
+// inverse: out[0:256] is the tile after a plain x4 round trip (equal to in)
+// and out[256:512] after x4.trans (each 8x8 matrix transposed). x2.trans and
+// x1.trans do the same for the first two / the first matrix, into out[512:]
+// and out[640:]. One warp.
+func StMatrixRoundTrip(in, out cuda.Buf[cuda.Half]) {
+	t := stTile.Get()
+	lane := cuda.LaneID()
+	for i := lane; i < 4*64; i += 32 {
+		t[i] = in.At(i)
+	}
+	cuda.SyncWarp(cuda.FullMask)
+
+	row := &t[lane*8]
+	v4 := cuda.LdMatrix4(row)
+	v2 := cuda.LdMatrix2(row)
+	v1 := cuda.LdMatrix1(row)
+	cuda.SyncWarp(cuda.FullMask)
+
+	cuda.StMatrix4(row, v4) // the same layout back in: the tile is unchanged
+	cuda.SyncWarp(cuda.FullMask)
+	for i := lane; i < 4*64; i += 32 {
+		out.Set(i, t[i])
+	}
+
+	cuda.StMatrix4Trans(row, v4) // each 8x8 matrix transposed in place
+	cuda.SyncWarp(cuda.FullMask)
+	for i := lane; i < 4*64; i += 32 {
+		out.Set(4*64+i, t[i])
+	}
+
+	cuda.StMatrix2Trans(row, v2) // only the first two matrices are written
+	cuda.SyncWarp(cuda.FullMask)
+	for i := lane; i < 2*64; i += 32 {
+		out.Set(8*64+i, t[i])
+	}
+
+	cuda.StMatrix1Trans(row, v1) // only the first
+	cuda.SyncWarp(cuda.FullMask)
+	for i := lane; i < 64; i += 32 {
+		out.Set(10*64+i, t[i])
+	}
+}

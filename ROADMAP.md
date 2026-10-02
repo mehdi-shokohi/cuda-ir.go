@@ -97,11 +97,35 @@ pointer-taking API is generic over `*T` (`CpAsync`, `CpAsyncBulkG2S/S2G`, `IsGlo
 (`Ldg`, `Volatile/SetVolatile`, `Load/Store(i, hint)`, `View`) and `cuda.As[U](p)` for
 reinterpreting an element.
 
-## v0.5 — next
+## v0.5 — done: raw mma.sync shapes, ldmatrix/stmatrix, the other wmma types
+
+Proven by `TestTensor` (`examples/tensor`, any sm_80 GPU) and `TestHopper/StMatrix`
+(`examples/hopper`, `-sm sm_90 -ptx 80`). Every matmul subtest checks the result against a
+CPU model with `==`: the operands are small integers, so half, bfloat16 and tf32 hold them
+exactly. They are also deliberately asymmetric — an operand built from `i+j` or `i*j` makes
+`A[i+8][j] == A[i][j+8]`, and the mma A fragment holds exactly those two elements in
+different registers, so a matmul over such data still comes out right when two registers of
+a fragment are swapped. Every layout below was checked by mutating one index and confirming
+the test fails.
+
+| CUDA C / PTX | Go | how | proven by |
+|---|---|---|---|
+| `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` and `.f16.f16.f16.f16` | `MmaF16`, `MmaF16Half`; fragments `MmaA MmaB MmaAccF32 MmaAccF16` (`Regs`, `Elems`, `Fill`) | helper (the intrinsic takes 4+2 `<2 x half>` and 4 `float` registers, so the fragment is a `[N]uint32`/`[N]float32` behind a pointer; the helper carries its own `declare`) | `TestTensor/MmaF16` (64×64 matmul, row-major B, B^T and a loaded accumulator), `TestTensor/MmaF16Half` |
+| the same shape with `bf16` operands | `MmaBF16` (same fragment layout, so the same loads) | helper | `TestTensor/MmaBF16` |
+| `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`, `cvt.rna.tf32.f32` | `MmaTF32`, `FloatToTF32` | helper; `llvm.nvvm.f2tf32.rna` for the conversion | `TestTensor/MmaTF32` (B row-major and B^T) |
+| `mma.sync.aligned.m16n8k32.row.col.s32.{s8,u8}.{s8,u8}.s32`, `.satfinite` | `MmaS8 MmaU8 MmaS8Sat MmaU8Sat`, `MmaAccI32` | helper | `TestTensor/MmaInt8` |
+| the per-lane fragment layouts of all three shapes | `MmaLoadA16/MmaLoadB16[Col]`, `MmaLoadATF32/MmaLoadBTF32[Col]`, `MmaLoadA8/MmaLoadB8[Col]`, `MmaLoadAcc/MmaStoreAcc[I32,F16]` | plain Go: `laneID>>2` is the row group, `laneID&3` the column pair, as in the ISA tables | every matmul subtest above |
+| `ldmatrix.sync.aligned.m8n8.x1/x2/x4[.trans].b16` (sm_75) | `LdMatrix1/2/4[Trans](p *T)`, `MmaAFromRegs/MmaBFromRegs` | helper (`addrspacecast` to `addrspace(3)`; x1 returns a bare `i32`, x2/x4 an aggregate) | `TestTensor/LdMatrix` (every lane's registers against the ISA layout, element by element), `TestTensor/MmaLdMatrix` (a 16×16 · 16×8 product fed by `x4` and `x2.trans` — the fragments `ldmatrix` builds must equal `MmaLoadA16`'s and `MmaLoadB16`'s) |
+| `stmatrix.sync.aligned.m8n8.x1/x2/x4[.trans].b16` (sm_90) | `StMatrix1/2/4[Trans](p *T, v)` | helper | `TestHopper/StMatrix` (a round trip through `ldmatrix` leaves the tile unchanged, and `.trans` transposes each 8×8 matrix) |
+| `wmma` with `nv_bfloat16` (m16n16k16) | `WmmaLoadABF16[Col]/WmmaLoadBBF16[Col]`, `WmmaMmaBF16[RowCol/ColRow/ColCol]`, `FragABF16/FragBBF16` (the accumulator is the existing `FragC`) | helper | `TestTensor/WmmaBF16` (64×64 matmul + bias, row.row and row.col) |
+| `wmma` with `precision::tf32` (m16n16k8) | `WmmaLoadATF32[Col]/WmmaLoadBTF32[Col]/WmmaLoadCTF32[Col]/WmmaStoreTF32[Col]`, `WmmaMmaTF32[…]`, `FragATF32/FragBTF32` | helper (the m16n16k8 geometry has its own accumulator load/store intrinsics) | `TestTensor/WmmaTF32` |
+| `wmma` with `signed/unsigned char` → `int` (m16n16k16) | `WmmaLoadA{S8,U8}[Col]/WmmaLoadB{S8,U8}[Col]/WmmaLoadCI32[Col]/WmmaStoreI32[Col]`, `WmmaMma{S8,U8}[…]`, `FragAI8/FragBI8/FragCI32` | helper | `TestTensor/WmmaInt8` |
+
+## v0.6 — next
 
 | CUDA C | proposed Go | notes |
 |---|---|---|
-| `wgmma` (sm_90a), `mma.sync` raw shapes (`m16n8k16` …), `ldmatrix/stmatrix`, `bf16/tf32/int8` wmma, `__nv_fp8` | `MmaSync…`, `WmmaBF16…` | `llvm.nvvm.wgmma.*` needs `-sm sm_90a` (not runnable on sm_120 hardware; compile-check like `TestBlackwell`); `llvm.nvvm.mma.m16n8k16.*`, `llvm.nvvm.ldmatrix.*` |
+| `wgmma` (sm_90a), `__nv_fp8` mma (`m16n8k16` e4m3/e5m2, `m16n8k32` f8f6f4), sparse `mma.sp`, `mma.m8n8k4`/`m16n8k8` f16, f64 and sub-byte shapes | `Wgmma…`, `MmaFP8…`, `MmaSp…` | `llvm.nvvm.wgmma.*` needs `-sm sm_90a` (not runnable on sm_120 hardware; compile-check like `TestBlackwell`). The fp8 and sparse shapes are the same helper pattern as v0.5, so they are mechanical; fp8 needs `sm_89`+ and host-side e4m3/e5m2 conversion in the tests |
 | TMA tensor maps: `cp.async.bulk.tensor` (2D–5D tiles), multicast to the cluster | `CpAsyncBulkTensor2D(map, …)` | needs `cuTensorMapEncodeTiled` on the host (not in gocudrv yet); `llvm.nvvm.cp.async.bulk.tensor.*` |
 | Runtime cluster dims and programmatic dependent launch attributes | host side | `cuLaunchKernelEx` launch attributes — gocudrv v0.3 has no `LaunchKernelEx`; the compile-time `//cuda:cluster_dims` route works today |
 | `tex1D/tex3D`, layered / cubemap textures, 4-channel arrays | existing API | proven on hardware once gocudrv grows 1D/3D/multi-channel arrays |

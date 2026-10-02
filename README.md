@@ -343,6 +343,9 @@ All verified on hardware by `go test .` (`examples/features`, `examples/intrinsi
 | `printf(fmt, ...)` | `Printf(fmt, Args().Int(i).Float(x)...)` |
 | `%pm0..%pm3` | `PerfCounter0..3()` |
 | `wmma::load_matrix_sync / mma_sync / store_matrix_sync` (m16n16k16, half → float) | `WmmaLoadA[Col]/WmmaLoadB[Col]/WmmaLoadC[Col]`, `WmmaMma[RowCol/ColRow/ColCol]`, `WmmaStore[Col]`, `FragA/FragB/FragC` (`Fill`, `Elems`) |
+| `wmma` with `nv_bfloat16` (m16n16k16), `precision::tf32` (m16n16k8) and `signed/unsigned char` → `int` (m16n16k16) | `WmmaLoadABF16[Col]/WmmaLoadBBF16[Col]` + `WmmaMmaBF16[RowCol/ColRow/ColCol]`; `WmmaLoadATF32[Col]/WmmaLoadBTF32[Col]/WmmaLoadCTF32[Col]/WmmaStoreTF32[Col]` + `WmmaMmaTF32[...]`; `WmmaLoadA{S8,U8}[Col]/WmmaLoadB{S8,U8}[Col]/WmmaLoadCI32[Col]/WmmaStoreI32[Col]` + `WmmaMma{S8,U8}[...]`; `FragABF16/FragBBF16 FragATF32/FragBTF32 FragAI8/FragBI8 FragCI32` |
+| `mma.sync.aligned` raw shapes: `m16n8k16` (f16/bf16 → f16 or f32), `m16n8k8` (tf32), `m16n8k32` (s8/u8 → s32, `.satfinite`) | `MmaF16 MmaF16Half MmaBF16 MmaTF32 MmaS8 MmaU8 MmaS8Sat MmaU8Sat`; fragments `MmaA MmaB MmaAccF32 MmaAccF16 MmaAccI32` (`Regs`, `Elems`, `Fill`) built by `MmaLoadA16/MmaLoadB16[Col]`, `MmaLoadATF32/MmaLoadBTF32[Col]`, `MmaLoadA8/MmaLoadB8[Col]`, `MmaLoad/StoreAcc[I32,F16]`, `FloatToTF32` |
+| `ldmatrix.sync.aligned.m8n8.x1/x2/x4[.trans].b16` (sm_75), `stmatrix` (sm_90) | `LdMatrix1/2/4[Trans](p)`, `StMatrix1/2/4[Trans](p, v)`, `MmaAFromRegs/MmaBFromRegs` |
 | `tex1D/tex2D/tex3D<float4>`, `tex2D<int4/uint4>`, `tex1Dfetch`, `txq` | `Tex1D Tex2D Tex3D Tex2DInt Tex2DUint Tex1DFetch TexWidth TexHeight` on a `cuda.Texture` |
 | `surf1Dread/write`, `surf2Dread/write` (32-bit) | `Surf1D/Surf2D{Read,Write}{Int32,Float32}` on a `cuda.Surface` |
 | `__ldca/__ldcg/__ldcs/__ldlu/__ldcv`, `__stwb/__stcg/__stcs/__stwt` | `buf.Load(i, cuda.CG)` / `buf.Store(i, v, cuda.CS)` (hints `CA CG CS LU CV WB WT`), `LoadHint/StoreHint(p, …)`, `LoadCG{Int32,…}` … |
@@ -387,7 +390,11 @@ go test -v .     # the README VecAdd sample as a Go test (main_test.go)
   groups sugar, `%pm` counters
 - `examples/hopper` (`go test -run TestHopper`, sm_90, needs a compute capability ≥ 9.0 GPU) —
   thread block clusters + distributed shared memory, `mbarrier`, TMA bulk copies,
-  `elect.sync`, `griddepcontrol`, and `MatMul16`, the README's TMA-fed tensor-core matmul
+  `elect.sync`, `griddepcontrol`, `stmatrix`, and `MatMul16`, the README's TMA-fed
+  tensor-core matmul
+- `examples/tensor` (`go test -run TestTensor`) — the raw `mma.sync` shapes (m16n8k16
+  half/bfloat16, m16n8k8 tf32, m16n8k32 s8/u8), `ldmatrix`, and `wmma` with bfloat16, tf32
+  and 8-bit integer operands; every matmul is checked against a CPU model
 - `examples/blackwell` (`go test -run TestBlackwell`, sm_100a) — `redux.sync` on floats;
   compiled everywhere, executed on a 10.x GPU
 
@@ -422,9 +429,10 @@ llgo has no NVPTX target; its output needs these rewrites (`cudair.Build` / `goc
    exported globals keep their Go name for `cuModuleGetGlobal`
 7. `cuda.Buf[T]` kernel parameters become plain pointer parameters, so llc knows they are
    global memory (`ld.global` instead of generic loads; `__ldg` → `ld.global.nc`)
-8. `cudair.*` IR helpers (`helpers.go`) supply what Go cannot spell: `atomicrmw min/max`,
-   scoped/acquire-release atomics, volatile and invariant loads, `half`/`bfloat` arithmetic,
-   `<4 x float>` accesses, `cp.async`, `wmma` fragments, `mbarrier`/TMA address spaces and
+8. `cudair.*` IR helpers (`helpers.go`, `helpers_mma.go`) supply what Go cannot spell:
+   `atomicrmw min/max`, scoped/acquire-release atomics, volatile and invariant loads,
+   `half`/`bfloat` arithmetic, `<4 x float>` accesses, `cp.async`, the `wmma` / `mma.sync` /
+   `ldmatrix` register aggregates, `mbarrier`/TMA address spaces and
    inline-asm PTX (`ld.global.cg`, `mbarrier.try_wait.parity`); `//cuda:launch_bounds` /
    `cluster_dims` directives become attributes, `//cuda:restrict` adds `noalias`,
    `//cuda:grid_constant` turns struct parameters into `byval` ones and drops llgo's local copy

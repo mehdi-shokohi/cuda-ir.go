@@ -499,6 +499,47 @@ func TestHopper(t *testing.T) {
 		}
 		fmt.Printf("GridDep: griddepcontrol.wait / launch_dependents executed\n")
 	})
+
+	t.Run("StMatrix", func(t *testing.T) { // stmatrix.m8n8.x1/x2/x4 (+.trans)
+		for _, want := range []string{"stmatrix.sync.aligned.m8n8.x4.shared.b16", "stmatrix.sync.aligned.m8n8.x4.trans.shared.b16",
+			"stmatrix.sync.aligned.m8n8.x2.trans.shared.b16", "stmatrix.sync.aligned.m8n8.x1.trans.shared.b16"} {
+			if !strings.Contains(ptx, want) {
+				t.Fatalf("PTX lacks %q", want)
+			}
+		}
+		// four 8x8 matrices of distinct halfs
+		in := make([]uint16, 4*64)
+		for i := range in {
+			in[i] = float32ToHalf(float32(i + 1))
+		}
+		dout := upload(t, ctx, make([]uint16, 11*64))
+		launch(t, ctx, mod, "StMatrixRoundTrip", cuda.LaunchConfig1D(32, 32), cuda.Arg(upload(t, ctx, in)), cuda.Arg(dout))
+		out := download(t, dout)
+		// x4 without .trans is the exact inverse of ldmatrix.x4
+		for i, v := range out[:4*64] {
+			if v != in[i] {
+				t.Fatalf("stmatrix.x4: tile[%d] = %#04x, want %#04x", i, v, in[i])
+			}
+		}
+		// the .trans forms transpose each 8x8 matrix; x2 and x1 leave the
+		// matrices they do not cover alone
+		for _, tc := range []struct {
+			name     string
+			off, mat int // offset in out, number of matrices written
+		}{{"x4.trans", 4 * 64, 4}, {"x2.trans", 8 * 64, 2}, {"x1.trans", 10 * 64, 1}} {
+			for m := 0; m < tc.mat; m++ {
+				for r := 0; r < 8; r++ {
+					for c := 0; c < 8; c++ {
+						got, want := out[tc.off+m*64+r*8+c], in[m*64+c*8+r]
+						if got != want {
+							t.Fatalf("stmatrix.%s: matrix %d [%d][%d] = %#04x, want %#04x", tc.name, m, r, c, got, want)
+						}
+					}
+				}
+			}
+		}
+		fmt.Printf("StMatrix: x1/x2/x4 (+.trans) invert ldmatrix element by element for all 32 lanes\n")
+	})
 }
 
 const blackwellPkg = "github.com/mehdi-shokohi/cuda-ir.go/examples/blackwell"
