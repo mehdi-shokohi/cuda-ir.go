@@ -283,7 +283,8 @@ Options:
 | `//cuda:cluster_dims 2 [1 [1]]` doc comment (sm_90) | `__cluster_dims__(2, 1, 1)` — launched with the plain grid, a multiple of the cluster |
 | `//cuda:restrict` doc comment | `__restrict__` on every pointer parameter (`noalias`; read-only ones become `ld.global.nc`) |
 | `//cuda:grid_constant` doc comment | `__grid_constant__` on every struct parameter: `&p` points into parameter space, no local copy; do not write to it |
-| `cuda.Texture` / `cuda.Surface` parameter | `cudaTextureObject_t` / `cudaSurfaceObject_t` — pass gocudrv's `cuda.ArgTexture` / `cuda.ArgSurface` |
+| `cuda.Texture` / `cuda.Surface` parameter | `cudaTextureObject_t` / `cudaSurfaceObject_t` — pass gocudrv's `cuda.ArgTexture` / `cuda.ArgSurface` for a 2D array, or `host.Texture.Arg()` / `host.Surface.Arg()` for any geometry |
+| `cuda.TensorMap` in a `cuda.Buf` | the 128-byte TMA descriptor `host.EncodeTiled` produces; keep it in global memory (Go cannot give a struct parameter the 64-byte alignment the hardware wants) |
 | `sync/atomic` on device pointers | native `atom.*` instructions |
 | `cuda.Sqrt/Sin/Exp/...`, `math.Sqrt/Float32bits/...`, `math/bits.*` | PTX instruction or libdevice |
 | `panic(...)`, nil deref, index out of range, integer `/ 0` | PTX `trap` → the launch fails with an error |
@@ -297,7 +298,8 @@ pointers — kernels never need `unsafe`. `cuda.Printf` is the device `printf`.
 ## Device API (CUDA C ↔ package cuda)
 
 All verified on hardware by `go test .` (`examples/features`, `examples/intrinsics`, `examples/memory`,
-`examples/advanced`, `examples/hopper`; `examples/blackwell` is compile-checked on GPUs below 10.x).
+`examples/advanced`, `examples/hopper`, `examples/hostapi`; `examples/blackwell` is compile-checked
+on GPUs below 10.x).
 
 | CUDA C | Go |
 |---|---|
@@ -346,20 +348,44 @@ All verified on hardware by `go test .` (`examples/features`, `examples/intrinsi
 | `wmma` with `nv_bfloat16` (m16n16k16), `precision::tf32` (m16n16k8) and `signed/unsigned char` → `int` (m16n16k16) | `WmmaLoadABF16[Col]/WmmaLoadBBF16[Col]` + `WmmaMmaBF16[RowCol/ColRow/ColCol]`; `WmmaLoadATF32[Col]/WmmaLoadBTF32[Col]/WmmaLoadCTF32[Col]/WmmaStoreTF32[Col]` + `WmmaMmaTF32[...]`; `WmmaLoadA{S8,U8}[Col]/WmmaLoadB{S8,U8}[Col]/WmmaLoadCI32[Col]/WmmaStoreI32[Col]` + `WmmaMma{S8,U8}[...]`; `FragABF16/FragBBF16 FragATF32/FragBTF32 FragAI8/FragBI8 FragCI32` |
 | `mma.sync.aligned` raw shapes: `m16n8k16` (f16/bf16 → f16 or f32), `m16n8k8` (tf32), `m16n8k32` (s8/u8 → s32, `.satfinite`) | `MmaF16 MmaF16Half MmaBF16 MmaTF32 MmaS8 MmaU8 MmaS8Sat MmaU8Sat`; fragments `MmaA MmaB MmaAccF32 MmaAccF16 MmaAccI32` (`Regs`, `Elems`, `Fill`) built by `MmaLoadA16/MmaLoadB16[Col]`, `MmaLoadATF32/MmaLoadBTF32[Col]`, `MmaLoadA8/MmaLoadB8[Col]`, `MmaLoad/StoreAcc[I32,F16]`, `FloatToTF32` |
 | `ldmatrix.sync.aligned.m8n8.x1/x2/x4[.trans].b16` (sm_75), `stmatrix` (sm_90) | `LdMatrix1/2/4[Trans](p)`, `StMatrix1/2/4[Trans](p, v)`, `MmaAFromRegs/MmaBFromRegs` |
-| `tex1D/tex2D/tex3D<float4>`, `tex2D<int4/uint4>`, `tex1Dfetch`, `txq` | `Tex1D Tex2D Tex3D Tex2DInt Tex2DUint Tex1DFetch TexWidth TexHeight` on a `cuda.Texture` |
-| `surf1Dread/write`, `surf2Dread/write` (32-bit) | `Surf1D/Surf2D{Read,Write}{Int32,Float32}` on a `cuda.Surface` |
+| `tex1D/tex2D/tex3D<float4>`, `tex2D<int4/uint4>`, `tex3D<int4>`, `tex1Dfetch`, `txq` | `Tex1D Tex2D Tex3D Tex2DInt Tex2DUint Tex3DInt Tex1DFetch TexWidth TexHeight` on a `cuda.Texture` |
+| `tex1DLayered/tex2DLayered`, `texCubemap/texCubemapLayered`, `tex2Dgather` | `Tex1DLayered Tex2DLayered Tex2DLayeredInt TexCubemap TexCubemapLayered Tex2DGather{Red,Green,Blue,Alpha}` |
+| `surf1Dread/write`, `surf2Dread/write`, `surf3Dread/write` (32-bit) | `Surf1D/Surf2D/Surf3D{Read,Write}{Int32,Float32}` on a `cuda.Surface` |
 | `__ldca/__ldcg/__ldcs/__ldlu/__ldcv`, `__stwb/__stcg/__stcs/__stwt` | `buf.Load(i, cuda.CG)` / `buf.Store(i, v, cuda.CS)` (hints `CA CG CS LU CV WB WT`), `LoadHint/StoreHint(p, …)`, `LoadCG{Int32,…}` … |
 | `this_thread_block()`, `tiled_partition<N>`, `coalesced_threads()`, `thread_rank/size/sync/shfl/ballot`, `cg::reduce` | `ThisBlock()`, `ThisWarp()`, `TiledPartition(n)`, `CoalescedThreads()` → `Block` / `Tile` methods |
 | `cluster.sync()`, `barrier.cluster.arrive/wait`, `%clusterid %cluster_ctarank %cluster_nctarank …`, `cluster.map_shared_rank(p, r)` (sm_90) | `ClusterSync/Arrive/Wait`, `ClusterIDX… ClusterCtaRank ClusterSize NumClustersX… ClusterBlockIdxX… ClusterDimX…`, `Shared[T].InCluster(rank)`, `MapShared(p, rank)`, `IsSharedCluster(p)`, `ThreadFenceCluster` |
 | `mbarrier.init/arrive/arrive_drop/test_wait/inval` (sm_80), `arrive.expect_tx/expect_tx/try_wait.parity` (sm_90) | `cuda.MBarrier` in shared memory: `Init Arrive ArriveDrop Wait TestWait ArriveExpectTx ExpectTx WaitParity TryWaitParity Inval`, `PendingCount`, `FenceMBarrierInit` |
 | TMA `cp.async.bulk` global ↔ shared, `commit_group / wait_group[.read]`, `fence.proxy.async` (sm_90) | `CpAsyncBulkG2S(dst, src *T, n, bar)`, `CpAsyncBulkS2G`, `Bytes[T](n)`, `CpAsyncBulkCommit`, `CpAsyncBulkWait0/1`, `CpAsyncBulkWaitRead0/1`, `FenceProxyAsyncShared` |
+| TMA tensor copies `cp.async.bulk.tensor.{1..5}d` global ↔ shared, tile mode (sm_90) | `CpAsyncBulkTensor1D..5D(dst *T, m *cuda.TensorMap, coords…, bar)`, `CpAsyncBulkTensorS2G1D..5D`; the descriptor comes from `host.EncodeTiled` |
 | `elect.sync` (sm_90) | `ElectSync(mask) (leader, elected)` |
 | `griddepcontrol.wait / launch_dependents` (sm_90) | `GridDepWait()`, `GridDepLaunchDependents()` |
 | `__reduce_min/max_sync(float)` (sm_100a) | `ReduceMinF32/MaxF32` (build with `-sm sm_100a -ptx 86`) |
 
 sm_90 features need `-sm sm_90 -ptx 80` (`cudair.Options{SM: "sm_90", PTX: "80"}`); the
-driver runs that PTX on any newer GPU. Next: `wgmma`, TMA tensor maps, runtime cluster /
-PDL launch attributes — see [ROADMAP.md](ROADMAP.md).
+driver runs that PTX on any newer GPU. Next: `wgmma`, fp8 and sparse mma, TMA `im2col` and
+cluster multicast — see [ROADMAP.md](ROADMAP.md).
+
+## Host API (package `host`)
+
+The launch side is [gocudrv](https://github.com/eitamring/gocudrv): context, device, streams,
+buffers, modules, `Launch`. Package `host` adds only what gocudrv does not reach, against the
+context gocudrv already owns — it never opens a second one. Still no cgo: the few missing
+driver entry points are bound with `purego.RegisterLibFunc`, so the host builds with
+`CGO_ENABLED=0` as before.
+
+| what | Go |
+|---|---|
+| a `[]T` kernel parameter | `host.ArgSlice(buf)` |
+| CUDA arrays of every geometry — 1D, 2D, 3D, layered, cubemap, 2- and 4-channel | `host.AllocArray1D/2D/3D/Layered1D/Layered2D/Cubemap[T](ctx, …)`, options `WithChannels(n)`, `WithSurfaceStore()`, `WithTextureGather()`; `arr.CopyFrom/CopyTo/Elements/Close` |
+| texture and surface objects over any of them, and over linear memory (for `tex1Dfetch`) | `host.NewTexture(arr, cuda.TextureConfig{…})`, `host.NewTextureLinear(ctx, buf, channels)`, `host.NewSurface(arr)`; pass with `tex.Arg()` / `surf.Arg()` |
+| TMA tensor maps (`cuTensorMapEncodeTiled`) | `host.EncodeTiled[T](ctx, buf, host.TiledTensor{DataType, GlobalDim, GlobalStrides, BoxDim, Swizzle, OOBFill, …})` → `host.TensorMap` (`Arg`, `Bytes`) |
+| launch attributes (`cuLaunchKernelEx`): runtime cluster dims, programmatic dependent launch, cooperative | `host.LoadModule(ctx, ptx)` → `Module.Function(name)` → `Function.LaunchEx(cfg, host.LaunchAttrs{ClusterDim: [3]uint32{2,1,1}}, args…)` |
+| a raw driver call of your own against gocudrv's context | `host.OnContext(ctx, func() error { … })` — pins the thread and makes the context current, which gocudrv does only on its own executor thread |
+
+gocudrv's `cuda.Arg*` constructors work with its own `Launch`; `LaunchEx` has its own
+(`host.ArgValue/ArgBuffer/ArgSliceEx/ArgBytes`) because `cuda.KernelArg`'s only method is
+unexported. [ROADMAP.md](ROADMAP.md#v06--done-the-host-side-gaps-package-host) explains why
+each piece is here rather than upstream.
 
 ## Examples
 
@@ -388,10 +414,14 @@ go test -v .     # the README VecAdd sample as a Go test (main_test.go)
 - `examples/advanced` (`go test -run TestAdvanced`) — tensor cores (`wmma`), textures and
   surfaces, `//cuda:restrict`, `//cuda:grid_constant`, cache-hint loads/stores, cooperative
   groups sugar, `%pm` counters
-- `examples/hopper` (`go test -run TestHopper`, sm_90, needs a compute capability ≥ 9.0 GPU) —
-  thread block clusters + distributed shared memory, `mbarrier`, TMA bulk copies,
-  `elect.sync`, `griddepcontrol`, `stmatrix`, and `MatMul16`, the README's TMA-fed
-  tensor-core matmul
+- `examples/hopper` (`go test -run 'TestHopper|TestLaunchEx|TestTensorMap'`, sm_90, needs a
+  compute capability ≥ 9.0 GPU) — thread block clusters + distributed shared memory,
+  `mbarrier`, TMA bulk copies and TMA *tensor* copies through a `host.EncodeTiled`
+  descriptor, `elect.sync`, `griddepcontrol`, `stmatrix`, runtime cluster dims via
+  `host.LaunchEx`, and `MatMul16`, the README's TMA-fed tensor-core matmul
+- `examples/hostapi` (`go test -run TestHostAPI`) — the CUDA array geometries package `host`
+  adds: `tex1D`/`tex3D`, layered and cubemap textures, 4-channel arrays, `tex2Dgather`,
+  `tex1Dfetch` over linear memory, 3D surfaces
 - `examples/tensor` (`go test -run TestTensor`) — the raw `mma.sync` shapes (m16n8k16
   half/bfloat16, m16n8k8 tf32, m16n8k32 s8/u8), `ldmatrix`, and `wmma` with bfloat16, tf32
   and 8-bit integer operands; every matmul is checked against a CPU model

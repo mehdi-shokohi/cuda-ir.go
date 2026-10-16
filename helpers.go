@@ -138,6 +138,32 @@ func init() {
 	helpers["fence.acq_rel.cluster"] = "define void @NAME() {\n  call void asm sideeffect \"fence.acq_rel.cluster;\", \"\"()\n  ret void\n}"
 	helpers["cp.async.bulk.g2s"] = "define void @NAME(ptr %dst, ptr %src, i32 %n, ptr %bar) {\n  %d = addrspacecast ptr %dst to ptr addrspace(7)\n  %s = addrspacecast ptr %src to ptr addrspace(1)\n  %b = addrspacecast ptr %bar to ptr addrspace(3)\n  call void @llvm.nvvm.cp.async.bulk.global.to.shared.cluster(ptr addrspace(7) %d, ptr addrspace(3) %b, ptr addrspace(1) %s, i32 %n, i16 0, i64 0, i1 false, i1 false)\n  ret void\n}"
 	helpers["cp.async.bulk.s2g"] = "define void @NAME(ptr %dst, ptr %src, i32 %n) {\n  %d = addrspacecast ptr %dst to ptr addrspace(1)\n  %s = addrspacecast ptr %src to ptr addrspace(3)\n  call void @llvm.nvvm.cp.async.bulk.shared.cta.to.global(ptr addrspace(1) %d, ptr addrspace(3) %s, i32 %n, i64 0, i1 false)\n  ret void\n}"
+
+	// TMA tensor copies (cp.async.bulk.tensor, sm_90+): the tile to move is
+	// described by a tensor map the host encoded (host.EncodeTiled) and
+	// named by a generic pointer, so the only cast needed is the shared
+	// tile (and the mbarrier, for the g2s direction). One helper per rank,
+	// since the coordinate count is part of the intrinsic.
+	for dim := 1; dim <= 5; dim++ {
+		coordParams := args("i32", "c", dim) // i32 %c0, i32 %c1, ...
+		coordArgs := args("i32", "c", dim)   // same spelling at the call
+		// The destination is cluster-shared (addrspace(7)) rather than
+		// plain shared: the .shared::cta form of cp.async.bulk.tensor
+		// only arrived in PTX ISA 8.6, while the cluster form is sm_90's
+		// own. With no cluster, a CTA's cluster-shared window is its own
+		// shared memory, so cta_mask 0 is right either way.
+		helpers[fmt.Sprintf("cp.async.bulk.tensor.g2s.%dd", dim)] = fmt.Sprintf(
+			"define void @NAME(ptr %%dst, ptr %%map, %s, ptr %%bar) {\n"+
+				"  %%d = addrspacecast ptr %%dst to ptr addrspace(7)\n"+
+				"  %%b = addrspacecast ptr %%bar to ptr addrspace(3)\n"+
+				"  call void @llvm.nvvm.cp.async.bulk.tensor.g2s.tile.%dd(ptr addrspace(7) %%d, ptr addrspace(3) %%b, ptr %%map, %s, i16 0, i64 0, i1 false, i1 false, i32 0)\n"+
+				"  ret void\n}", coordParams, dim, coordArgs)
+		helpers[fmt.Sprintf("cp.async.bulk.tensor.s2g.%dd", dim)] = fmt.Sprintf(
+			"define void @NAME(ptr %%src, ptr %%map, %s) {\n"+
+				"  %%s = addrspacecast ptr %%src to ptr addrspace(3)\n"+
+				"  call void @llvm.nvvm.cp.async.bulk.tensor.s2g.tile.%dd(ptr addrspace(3) %%s, ptr %%map, %s, i64 0, i1 false)\n"+
+				"  ret void\n}", coordParams, dim, coordArgs)
+	}
 }
 
 // extractAll returns IR lines that extract the n fields of the aggregate

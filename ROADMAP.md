@@ -121,14 +121,57 @@ the test fails.
 | `wmma` with `precision::tf32` (m16n16k8) | `WmmaLoadATF32[Col]/WmmaLoadBTF32[Col]/WmmaLoadCTF32[Col]/WmmaStoreTF32[Col]`, `WmmaMmaTF32[…]`, `FragATF32/FragBTF32` | helper (the m16n16k8 geometry has its own accumulator load/store intrinsics) | `TestTensor/WmmaTF32` |
 | `wmma` with `signed/unsigned char` → `int` (m16n16k16) | `WmmaLoadA{S8,U8}[Col]/WmmaLoadB{S8,U8}[Col]/WmmaLoadCI32[Col]/WmmaStoreI32[Col]`, `WmmaMma{S8,U8}[…]`, `FragAI8/FragBI8/FragCI32` | helper | `TestTensor/WmmaInt8` |
 
-## v0.6 — next
+## v0.6 — done: the host-side gaps (package `host`)
+
+Three v0.6 rows were blocked not on the device side but on the host: gocudrv
+v0.3.2 does not bind `cuTensorMapEncodeTiled` or `cuLaunchKernelEx`, and its
+typed array wrapper is fixed at 2D single-channel. None of that needed an
+upstream change. gocudrv exposes its loaded driver (`Context.Driver`), its raw
+context (`Context.Raw`) and its device pointers (`Buffer.DevicePtr`) so a
+sibling module can work against the context it already owns, so package `host`
+takes that route: the context, device, streams and buffers stay gocudrv's, and
+only the missing entry points are bound here, with `purego.RegisterLibFunc`
+against the same `libcuda.so.1` (dlopen refcounts — one mapping, one context).
+The host still builds with `CGO_ENABLED=0`.
+
+Two things to know when reading `host`:
+
+- **Thread affinity.** gocudrv makes its context current only on its own
+  executor thread, so a raw driver call from any other goroutine sees no
+  context at all. `host.OnContext` pins the calling goroutine, makes the
+  context current, runs the call and restores the thread's previous context.
+  Work issued inside it is not serialised against concurrent gocudrv calls.
+- **`cuLaunchKernelEx` needs a `CUfunction`**, and gocudrv's `Function` has no
+  `Raw` accessor — the one thing an upstream patch would improve. So
+  `host.LoadModule` loads the PTX itself (through gocudrv's exported
+  `cudaresult.ModuleLoadData`) and keeps its own handle. A two-line
+  `Function.Raw()` upstream would let `host/launchex.go` go away; it is not a
+  prerequisite for anything here.
+
+Proven by `TestHostAPI` (`examples/hostapi`, any sm_80 GPU), `TestLaunchEx`
+and `TestTensorMap` (`examples/hopper`, `-sm sm_90 -ptx 80`, compute
+capability ≥ 9.0 — tested on sm_120).
+
+| CUDA C | Go | how | proven by |
+|---|---|---|---|
+| `cuTensorMapEncodeTiled`, `cp.async.bulk.tensor.{1..5}d.shared::cluster.global.tile` / `.global.shared::cta.tile` (sm_90) | host: `host.TiledTensor`, `host.EncodeTiled[T]`/`EncodeTiledPtr` → `host.TensorMap` (`Arg`, `Bytes`); device: `cuda.TensorMap`, `CpAsyncBulkTensor1D..5D`, `CpAsyncBulkTensorS2G1D..5D` | `cuTensorMapEncodeTiled` bound with `purego.RegisterLibFunc` (12 args, typed); the descriptor is kept 64-byte aligned inside an oversized heap allocation. Device side: one helper per rank casting the tile to `addrspace(7)` and the mbarrier to `addrspace(3)` for `llvm.nvvm.cp.async.bulk.tensor.{g2s,s2g}.tile.Nd` | `TestTensorMap/TensorTile2D` (six 32×32 tiles global → shared → global through two maps, doubled in between), `TestTensorMap/OutOfBounds` (a 40×40 tensor in 32×32 tiles, clamped at the edges), `TestTensorMap/Encode` (a valid descriptor accepted, five invalid ones rejected) |
+| `cuLaunchKernelEx` launch attributes: `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION` (runtime cluster dims), `…PROGRAMMATIC_STREAM_SERIALIZATION` (makes `griddepcontrol` live), `…COOPERATIVE` | `host.LoadModule` → `Module.Function` → `Function.LaunchEx(cfg, host.LaunchAttrs{…}, args…)`, with `host.Arg`/`ArgValue`/`ArgBuffer`/`ArgSliceEx`/`ArgBytes` | `cuLaunchKernelEx` bound here, plus a `CUlaunchConfig`/`CUlaunchAttribute` layout; the module is loaded by `host` because gocudrv keeps its `CUfunction` private. gocudrv's `cuda.KernelArg` cannot be reused — its only method is unexported — so `LaunchEx` has its own argument constructors | `TestLaunchEx/RuntimeClusterDims` (clusters of 1, 2 and 4 over 8 blocks; `%cluster_ctarank` and `%cluster_nctarank` checked against each shape, on a kernel whose PTX deliberately has **no** `.reqnctapercluster`), `TestLaunchEx/ProgrammaticDependentLaunch`, `TestLaunchEx/Cooperative` |
+| `tex1D`, `tex3D`, `tex1DLayered`/`tex2DLayered`, `texCubemap`/`texCubemapLayered`, `tex2Dgather`, `tex1Dfetch` over linear memory, 2- and 4-channel arrays, `surf3Dread`/`surf3Dwrite` | host: `host.AllocArray[T]` + `AllocArray1D/2D/3D/Layered1D/Layered2D/Cubemap`, `WithChannels/WithSurfaceStore/WithTextureGather`, `host.NewTexture`/`NewTextureLinear`/`NewSurface`; device: `cuda.Tex1DLayered/Tex2DLayered[Int]/TexCubemap[Layered]/Tex3DInt/Tex2DGather{Red,Green,Blue,Alpha}/Surf3D{Read,Write}{Int32,Float32}` | **no new binding**: `cuArray3DCreate`, `cuMemcpy3D`, `cuTexObjectCreate`, `cuSurfObjectCreate` and their descriptors are already bound and exported by gocudrv — only the typed wrapper above 2D single-channel was missing. The exception is `tex1Dfetch`, which reads *linear* memory: its `res.linear` case falls in the 120 bytes gocudrv's `CUDA_RESOURCE_DESC` keeps as reserved padding, so `host` carries the full `CUDA_RESOURCE_DESC` (array, linear and pitch2D) and binds `cuTexObjectCreate` itself | `TestHostAPI/Tex1D` (`tex1D` over a 1D array, `tex1Dfetch` over linear memory, `txq.width`, array round trip), `/Tex3D`, `/Channels4` (a 4-channel array fills r,g,b,a), `/Layered` (3 layers of 8×4 and of 8), `/Cubemap` (all six faces selected by direction), `/Gather` (the four bilinear texels, against a CPU model with clamping), `/Surface3D` |
+
+Also on the way: `cuda.Shared` globals are now 128-byte aligned rather than 16.
+A `cp.async.bulk.tensor` destination must be 128-byte aligned or the copy
+faults with `CUDA_ERROR_MISALIGNED_ADDRESS`; shared memory is plentiful, so
+every `Shared` global gets the strictest alignment any shared access needs.
+`cp.async.bulk.tensor`'s `.shared::cta` destination form only arrived in PTX
+ISA 8.6, so the g2s helpers target `shared::cluster` (`addrspace(7)`) — with no
+cluster, a CTA's cluster-shared window is its own shared memory.
+
+## v0.6 — still to do
 
 | CUDA C | proposed Go | notes |
 |---|---|---|
 | `wgmma` (sm_90a), `__nv_fp8` mma (`m16n8k16` e4m3/e5m2, `m16n8k32` f8f6f4), sparse `mma.sp`, `mma.m8n8k4`/`m16n8k8` f16, f64 and sub-byte shapes | `Wgmma…`, `MmaFP8…`, `MmaSp…` | `llvm.nvvm.wgmma.*` needs `-sm sm_90a` (not runnable on sm_120 hardware; compile-check like `TestBlackwell`). The fp8 and sparse shapes are the same helper pattern as v0.5, so they are mechanical; fp8 needs `sm_89`+ and host-side e4m3/e5m2 conversion in the tests |
-| TMA tensor maps: `cp.async.bulk.tensor` (2D–5D tiles), multicast to the cluster | `CpAsyncBulkTensor2D(map, …)` | needs `cuTensorMapEncodeTiled` on the host (not in gocudrv yet); `llvm.nvvm.cp.async.bulk.tensor.*` |
-| Runtime cluster dims and programmatic dependent launch attributes | host side | `cuLaunchKernelEx` launch attributes — gocudrv v0.3 has no `LaunchKernelEx`; the compile-time `//cuda:cluster_dims` route works today |
-| `tex1D/tex3D`, layered / cubemap textures, 4-channel arrays | existing API | proven on hardware once gocudrv grows 1D/3D/multi-channel arrays |
+| TMA `im2col` mode, `cp.async.bulk.tensor` multicast to the cluster, `prefetch`, and the `reduce_{add,min,max,…}` copies | `CpAsyncBulkTensorIm2col…`, a `cta_mask` argument, `CpAsyncBulkTensorPrefetch…`, `CpAsyncBulkTensorReduce…` | the tile mode is done (above); these are the remaining modes of the same intrinsic family, and `host.TiledTensor` already has the `Interleave`/`Swizzle` knobs a multicast matmul wants. `cuTensorMapEncodeIm2col` is in the driver but not yet bound |
 | `__nanosleep`-based `cuda::barrier` phases, `cuda::pipeline` sugar over `cp.async` / TMA | `Pipeline` helper | pure Go over the existing primitives |
 | `redux.sync.f32` on hardware | — | needs a 10.x GPU |
 
@@ -139,6 +182,8 @@ the test fails.
   stack-based (`alloca`) and dies with the kernel; use pre-allocated buffers for anything else.
 - Go `make/append/map/string operations/interface/goroutine/defer/closure` on the device —
   stay compile errors.
-- Streams, events, graphs, unified memory, `cudaMemcpyAsync`, `cudaOccupancy*`, texture /
-  surface objects, launch attributes — host API, covered by
-  [gocudrv](https://github.com/eitamring/gocudrv).
+- Streams, events, graphs, unified memory, `cudaMemcpyAsync`, `cudaOccupancy*` — host API,
+  covered by [gocudrv](https://github.com/eitamring/gocudrv). Texture and surface objects,
+  CUDA arrays, launch attributes and TMA tensor maps are host API too, but the parts gocudrv
+  does not reach are in package `host` (see v0.6): it shares gocudrv's context rather than
+  opening its own.

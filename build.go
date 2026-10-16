@@ -72,7 +72,7 @@ var (
 	reAllocaLine = regexp.MustCompile(`^\s*(%[^ ]+) = alloca i8, i64 [^,]+, align \d+(\n\s*call void @llvm\.memset[^\n]*)?$`)
 	reDeclName   = regexp.MustCompile(`^declare .*@("[^"]+"|[^(]+)\(`)
 	// a global's alignment below 16
-	reAlignSmall = regexp.MustCompile(`, align (1|2|4|8)$`)
+	reAlignSmall = regexp.MustCompile(`, align (1|2|4|8|16|32|64)$`)
 )
 
 const libdevicePrefix = "__nv_"
@@ -859,9 +859,12 @@ func fixup(src []byte, rootPkg string, want map[string]bool, dirs map[string]dir
 			default:
 				line = strings.Replace(line, "global %", "addrspace(3) global %", 1)
 				line = strings.Replace(line, "zeroinitializer", "undef", 1)
-				// 16-byte aligned like the dynamic block: vector accesses,
-				// cp.async and TMA copies need it
-				line = reAlignSmall.ReplaceAllString(line, ", align 16")
+				// 128-byte aligned: vector accesses and cp.async need 16,
+				// and a cp.async.bulk.tensor destination needs 128 (it
+				// faults with CUDA_ERROR_MISALIGNED_ADDRESS otherwise).
+				// Shared memory is plentiful, so every Shared global gets
+				// the strictest of them.
+				line = reAlignSmall.ReplaceAllString(line, ", align 128")
 			}
 		} else if len(cudaGlobals) > 0 {
 			cast := func(name string) string {

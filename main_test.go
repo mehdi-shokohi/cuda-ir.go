@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -292,7 +293,10 @@ func findLLGoRoot() string {
 func TestSharedTypeUnification(t *testing.T) {
 	res := buildKernels(t, "github.com/mehdi-shokohi/cuda-ir.go/examples/features", nil)
 	ptx := string(res.PTX)
-	if !strings.Contains(ptx, ".shared .align 16 .b8 github_com_mehdi_shokohi_cuda_ir_go_examples_features_scratch[32]") {
+	// the alignment is whatever fixup settles on (the strictest any shared
+	// access needs); what matters here is the address space and the size.
+	reShared := regexp.MustCompile(`\.shared \.align \d+ \.b8 github_com_mehdi_shokohi_cuda_ir_go_examples_features_scratch\[32\]`)
+	if !reShared.MatchString(ptx) {
 		t.Fatalf("scratch is not __shared__:\n%s", grepLines(ptx, "features_scratch"))
 	}
 	ctx, mod, _ := loadKernels(t, "github.com/mehdi-shokohi/cuda-ir.go/examples/features")

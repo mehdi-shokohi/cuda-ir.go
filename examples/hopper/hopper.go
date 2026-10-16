@@ -126,6 +126,66 @@ func GridDep(out cuda.Buf[int32]) {
 	cuda.ThreadFenceCluster()
 }
 
+// ---- TMA tensor copies (cp.async.bulk.tensor)
+
+const tensorTile = 32
+
+var tensorTileBuf cuda.Shared[[tensorTile * tensorTile]float32]
+var tensorTileBar cuda.Shared[cuda.MBarrier]
+
+// TensorTileDouble moves one 32x32 tile out of a 2D tensor with a TMA tensor
+// copy, doubles it in shared memory and writes it back as the tile at the
+// same coordinates of a second tensor. The shape, strides and edge clamping
+// all come from the two descriptors the host encoded, so the kernel only
+// names the tile's origin: block (bx, by) takes the tile at
+// (bx*32, by*32), and a tile that hangs off the edge is filled per the
+// map's OOBFill.
+//
+// src and dst are Buf[cuda.TensorMap] rather than parameters because the
+// descriptor needs 64-byte alignment, which Go cannot ask of a struct
+// parameter but cuMemAlloc gives for free.
+func TensorTileDouble(src, dst cuda.Buf[cuda.TensorMap]) {
+	t, b := tensorTileBuf.Get(), tensorTileBar.Get()
+	tid := cuda.ThreadIdxX()
+	x0 := cuda.BlockIdxX() * tensorTile
+	y0 := cuda.BlockIdxY() * tensorTile
+
+	if tid == 0 {
+		b.Init(1)
+		cuda.FenceMBarrierInit()
+	}
+	cuda.SyncThreads()
+	if tid == 0 {
+		token := b.ArriveExpectTx(cuda.Bytes[float32](tensorTile * tensorTile))
+		cuda.CpAsyncBulkTensor2D(&t[0], src.Ptr(0), x0, y0, b)
+		b.Wait(token)
+	}
+	cuda.SyncThreads()
+
+	for i := tid; i < tensorTile*tensorTile; i += cuda.BlockDimX() {
+		t[i] *= 2
+	}
+	cuda.SyncThreads()
+
+	if tid == 0 {
+		cuda.FenceProxyAsyncShared() // the stores above, seen by the async proxy
+		cuda.CpAsyncBulkTensorS2G2D(&t[0], dst.Ptr(0), x0, y0)
+		cuda.CpAsyncBulkCommit()
+		cuda.CpAsyncBulkWait0()
+	}
+}
+
+// ClusterRankRuntime carries no //cuda:cluster_dims, so its PTX has no
+// .reqnctapercluster and the cluster shape can only come from the launch
+// attribute (host.LaunchEx with LaunchAttrs.ClusterDim). Block b writes
+// rank + 100*size, so both the shape and the ranks within it are visible.
+func ClusterRankRuntime(out cuda.Buf[int32]) {
+	if cuda.ThreadIdxX() != 0 {
+		return
+	}
+	out.Set(cuda.BlockIdxX(), cuda.ClusterCtaRank()+100*cuda.ClusterSize())
+}
+
 // ---- the README sample: TMA-fed tensor-core matmul
 
 var mmBar cuda.Shared[cuda.MBarrier]       // __shared__ cuda::barrier
